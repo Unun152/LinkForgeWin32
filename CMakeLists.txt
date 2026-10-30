@@ -35,4 +35,8 @@ target_link_libraries(LinkForge PRIVATE
 
 if(MSVC)
     target_compile_options(LinkForge PRIVATE /W4 /permissive- /EHsc /utf-8)
+
+    # app.rc embeds the explicit application manifest as resource ID 1.
+    # Disable the linker's implicit manifest embedding to avoid a duplicate RT_MANIFEST.
+    target_link_options(LinkForge PRIVATE /MANIFEST:NO)
 endif()

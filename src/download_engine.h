@@ -12,23 +12,42 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace linkforge {
+
+struct DownloaderSettings {
+    int maxTotalConnections = 8;
+    int maxConnectionsPerMirror = 2;
+    bool rampUpConnections = true;
+    unsigned int rampUpDelayMs = 500;
+    bool reduceConnectionsOnThrottle = true;
+    bool retryFailedMirrors = true;
+    unsigned int retryDelaySeconds = 5;
+    unsigned int maxRetriesPerMirror = 0; // 0 = unlimited retries
+    bool sendUserAgent = true;
+    std::wstring userAgent = L"LinkForge/1.0";
+    int segmentSizeMB = 0; // 0 = automatic; 1..64 = fixed chunk size
+};
 
 enum class DownloadPhase {
     Queued,
     Probing,
     DownloadingParallel,
     DownloadingFallback,
+    Pausing,
     Completed,
     Failed,
-    Cancelled
+    Cancelled,
+    CancelledKept,
+    Paused
 };
 
 struct Mirror {
@@ -45,7 +64,17 @@ struct Mirror {
     bool rangeFailed = false;
     bool fallbackTried = false;
     int activeRequests = 0;
+    uint64_t completedChunks = 0; // chunks completed by this mirror during this app session
+    uint64_t failedChunks = 0;
     int failures = 0;
+    int probeAttempts = 0;
+    int fallbackAttempts = 0;
+    int successfulConnections = 0;
+    int throttleConnectionLimit = 0; // 0 = configured per-mirror limit
+    int successesSinceThrottle = 0;
+    uint64_t nextConnectionTick = 0;
+    uint64_t throttleUntilTick = 0;
+    bool probeRunning = false;
     unsigned int lastHttpStatus = 0;
     uint64_t networkBytes = 0;
     uint64_t firstTransferTick = 0;
@@ -61,6 +90,26 @@ struct Mirror {
     std::vector<unsigned char> suffixSample;
 };
 
+struct DownloadResumeState {
+    std::wstring partPath;
+    bool sizeKnown = false;
+    uint64_t totalSize = 0;
+    uint64_t segmentBytes = 0;
+    uint64_t referencePrefixHash = 0;
+    uint64_t referenceMiddleHash = 0;
+    uint64_t referenceSuffixHash = 0;
+    std::vector<uint64_t> completedSegmentIndices;
+    std::vector<std::pair<uint64_t, uint64_t>> partialSegmentBytes; // segment index -> durable bytes in that segment
+    bool singleMirrorOnly = false;
+    bool wasCompleted = false;
+    bool wasFailed = false;
+    bool wasCancelled = false;
+    bool wasCancelledKept = false;
+    bool wasPaused = false;
+    bool resumeFallbackPending = false;
+    std::wstring resumeFallbackMirrorUrl;
+};
+
 struct Segment {
     uint64_t start = 0;
     uint64_t end = 0; // inclusive
@@ -68,20 +117,27 @@ struct Segment {
     int attempts = 0;
     int mirrorId = -1;
     uint64_t inFlightBytes = 0;
+    uint64_t committedBytes = 0; // bytes safely flushed to disk, retained when a range is paused/retried
 };
 
 class Download : public std::enable_shared_from_this<Download> {
 public:
     explicit Download(const std::wstring& outputFolder,
                       const std::wstring& outputName,
-                      const std::vector<std::wstring>& urls);
+                      const std::vector<std::wstring>& urls,
+                      const DownloadResumeState* resume = nullptr,
+                      bool singleMirrorOnly = false);
     ~Download();
 
     Download(const Download&) = delete;
     Download& operator=(const Download&) = delete;
 
     void Start();
-    void RequestCancel();
+    void RequestCancel(bool keepPartial = false);
+    void Pause();
+    void Resume();
+    bool IsPaused() const;
+    bool IsRunning() const;
     void Join();
     void Retry();
     void AddMirrors(const std::vector<std::wstring>& urls);
@@ -109,12 +165,32 @@ public:
     uint64_t networkBytes = 0;
     uint64_t firstTransferTick = 0;
     uint64_t endTransferTick = 0;
-    double speedBps = 0.0;
+    double speedBps = 0.0; // short-interval network throughput for the Speed column
+    double etaSpeedBps = 0.0; // rolling average of actual progress, used only for ETA
+    std::deque<std::pair<uint64_t, uint64_t>> etaSpeedSamples; // tick -> completed + in-flight progress bytes
     uint64_t lastSpeedSampleBytes = 0;
     uint64_t speedSampleTick = 0;
 
     bool started = false;
     bool terminal = false;
+    bool userPaused = false;
+    bool pauseSettled = false; // true once active network writes have been flushed and stopped
+    bool pauseCheckpointPending = false;
+    std::atomic<bool> pauseRequested{false};
+    uint64_t persistentSegmentBytes = 0;
+    bool restorePending = false;
+    uint64_t restoredTotalSize = 0;
+    uint64_t restoredSegmentBytes = 0;
+    uint64_t restoredReferencePrefixHash = 0;
+    uint64_t restoredReferenceMiddleHash = 0;
+    uint64_t restoredReferenceSuffixHash = 0;
+    uint64_t referencePrefixHash = 0;
+    uint64_t referenceMiddleHash = 0;
+    uint64_t referenceSuffixHash = 0;
+    std::vector<uint64_t> restoredCompletedSegmentIndices;
+    std::vector<std::pair<uint64_t, uint64_t>> restoredPartialSegmentBytes;
+    bool resumeFallbackPending = false;
+    std::wstring resumeFallbackMirrorUrl;
     bool initialProbeComplete = false;
     bool referenceReady = false;
     bool referenceSizeKnown = false;
@@ -129,8 +205,14 @@ public:
     int completedSegments = 0;
     bool engineFallbackNeeded = false;
     bool restartAsParallel = false;
+    bool parallelPoolPaused = false; // worker pool exited because of user pause; manager must rebuild it after Resume
     bool parallelMode = false;
+    bool singleMirrorOnly = false; // explicit per-download mode; never silently downgrade parallel to sequential
     std::atomic<bool> cancelRequested{false};
+    std::atomic<bool> keepPartialOnCancel{false};
+    std::atomic<bool> stopProbeRequests{false};
+    bool partialKept = false;
+    std::wstring partialPath;
 
 private:
     void Run();
@@ -139,8 +221,10 @@ private:
     bool PrepareParallelFile(std::wstring& error);
     bool FinalizeFile(std::wstring& error);
     void CleanupPartFile();
+    void PreservePartialFile();
+    void FinishCancelled();
     void ProbeInitialMirrors();
-    void ProbeOne(const std::shared_ptr<Mirror>& mirror, bool dynamicProbe);
+    void ProbeOne(const std::shared_ptr<Mirror>& mirror);
     void ReevaluateMirrorsLocked();
     void SpawnProbeThread(const std::shared_ptr<Mirror>& mirror);
     void JoinAuxiliaryThreads();
@@ -150,6 +234,8 @@ private:
     std::vector<std::thread> auxiliaryThreads;
 };
 
+DownloaderSettings GetSettings();
+void SetSettings(const DownloaderSettings& settings);
 bool InitializeHttp();
 void ShutdownHttp();
 std::wstring PhaseToString(DownloadPhase phase);

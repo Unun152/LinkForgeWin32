@@ -25,6 +25,7 @@
 using linkforge::Download;
 using linkforge::DownloadPhase;
 using linkforge::Mirror;
+using linkforge::Segment;
 
 namespace {
 
@@ -33,6 +34,8 @@ constexpr wchar_t kTextDialogClass[] = L"LinkForgeTextDialog";
 constexpr wchar_t kDetailsClass[] = L"LinkForgeDetailsWindow";
 constexpr wchar_t kSettingsClass[] = L"LinkForgeSettingsWindow";
 constexpr UINT_PTR kUiTimer = 1;
+constexpr uint64_t kEtaAverageWindowMs = 8000;
+constexpr uint64_t kEtaMinimumWindowMs = 2000;
 
 constexpr int ID_ADD_DOWNLOAD = 1001;
 constexpr int ID_DETAILS = 1002;
@@ -41,6 +44,7 @@ constexpr int ID_REMOVE = 1004;
 constexpr int ID_RETRY = 1005;
 constexpr int ID_OPEN_FOLDER = 1006;
 constexpr int ID_SETTINGS = 1007;
+constexpr int ID_PAUSE = 1008;
 
 constexpr int ID_DIALOG_URLS = 2001;
 constexpr int ID_DIALOG_FOLDER = 2002;
@@ -48,6 +52,7 @@ constexpr int ID_DIALOG_FILENAME = 2003;
 constexpr int ID_DIALOG_BROWSE = 2004;
 constexpr int ID_DIALOG_OK = 2005;
 constexpr int ID_DIALOG_CANCEL = 2006;
+constexpr int ID_DIALOG_MODE = 2007;
 
 constexpr int ID_DETAIL_LIST = 3001;
 constexpr int ID_DETAIL_ADD = 3002;
@@ -67,6 +72,7 @@ constexpr int ID_SETTINGS_USER_AGENT_ENABLE = 4009;
 constexpr int ID_SETTINGS_USER_AGENT = 4010;
 constexpr int ID_SETTINGS_SAVE = 4011;
 constexpr int ID_SETTINGS_CANCEL = 4012;
+constexpr int ID_SETTINGS_SEGMENT_SIZE = 4013;
 
 const COLORREF kWindowBg = RGB(22, 24, 29);
 const COLORREF kPanelBg = RGB(30, 33, 40);
@@ -82,7 +88,13 @@ HINSTANCE g_instance = nullptr;
 HWND g_mainWindow = nullptr;
 HWND g_mainList = nullptr;
 HWND g_statusText = nullptr;
+HWND g_pauseButton = nullptr;
 std::wstring g_configPath;
+std::wstring g_downloadsStatePath;
+uint64_t g_lastPersistTick = 0;
+std::vector<uint64_t> g_lastProgressBytes;
+std::vector<std::shared_ptr<Download>> g_autoResumeDownloads;
+std::vector<Download*> g_shutdownResumeDownloads;
 HFONT g_font = nullptr;
 HFONT g_fontTitle = nullptr;
 HBRUSH g_windowBrush = nullptr;
@@ -96,6 +108,8 @@ struct TextDialogState {
     HWND urlsEdit = nullptr;
     HWND folderEdit = nullptr;
     HWND filenameEdit = nullptr;
+    HWND modeCombo = nullptr;
+    bool singleMirrorOnly = false;
     bool mirrorMode = false;
     bool accepted = false;
     std::vector<std::wstring> urls;
@@ -126,6 +140,7 @@ struct SettingsContext {
     HWND retryCheck = nullptr;
     HWND retryDelayEdit = nullptr;
     HWND maxRetriesEdit = nullptr;
+    HWND segmentSizeEdit = nullptr;
     HWND userAgentCheck = nullptr;
     HWND userAgentEdit = nullptr;
     HWND tooltip = nullptr;
@@ -153,11 +168,19 @@ std::wstring GetDownloadsFolder() {
     return L"C:\\Downloads";
 }
 
-std::wstring GetConfigFilePath() {
+std::wstring GetExecutableDirectory() {
     std::vector<wchar_t> buffer(32768, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-    if (length == 0 || length >= buffer.size()) return L"LinkForge.ini";
-    return (std::filesystem::path(std::wstring(buffer.data(), length)).parent_path() / L"LinkForge.ini").wstring();
+    if (length == 0 || length >= buffer.size()) return std::filesystem::current_path().wstring();
+    return std::filesystem::path(std::wstring(buffer.data(), length)).parent_path().wstring();
+}
+
+std::wstring GetConfigFilePath() {
+    return (std::filesystem::path(GetExecutableDirectory()) / L"LinkForge.ini").wstring();
+}
+
+std::wstring GetDownloadsStateFilePath() {
+    return (std::filesystem::path(GetExecutableDirectory()) / L"LinkForgeDownloads.ini").wstring();
 }
 
 void LoadSettingsFromFile(linkforge::DownloaderSettings& settings) {
@@ -170,6 +193,7 @@ void LoadSettingsFromFile(linkforge::DownloaderSettings& settings) {
     settings.retryFailedMirrors = GetPrivateProfileIntW(L"Retry", L"RetryFailedMirrors", settings.retryFailedMirrors ? 1 : 0, g_configPath.c_str()) != 0;
     settings.retryDelaySeconds = GetPrivateProfileIntW(L"Retry", L"RetryDelaySeconds", settings.retryDelaySeconds, g_configPath.c_str());
     settings.maxRetriesPerMirror = GetPrivateProfileIntW(L"Retry", L"MaxRetriesPerMirror", settings.maxRetriesPerMirror, g_configPath.c_str());
+    settings.segmentSizeMB = GetPrivateProfileIntW(L"Download", L"SegmentSizeMB", settings.segmentSizeMB, g_configPath.c_str());
     settings.sendUserAgent = GetPrivateProfileIntW(L"HTTP", L"SendUserAgent", settings.sendUserAgent ? 1 : 0, g_configPath.c_str()) != 0;
     wchar_t userAgent[513]{};
     GetPrivateProfileStringW(L"HTTP", L"UserAgent", settings.userAgent.c_str(), userAgent,
@@ -180,6 +204,7 @@ void LoadSettingsFromFile(linkforge::DownloaderSettings& settings) {
     settings.rampUpDelayMs = std::clamp(settings.rampUpDelayMs, 0u, 60000u);
     settings.retryDelaySeconds = std::clamp(settings.retryDelaySeconds, 1u, 3600u);
     settings.maxRetriesPerMirror = std::min(settings.maxRetriesPerMirror, 100000u);
+    settings.segmentSizeMB = std::clamp(settings.segmentSizeMB, 0, 64);
 }
 
 bool SaveSettingsToFile(const linkforge::DownloaderSettings& settings) {
@@ -196,22 +221,313 @@ bool SaveSettingsToFile(const linkforge::DownloaderSettings& settings) {
     ok &= write(L"Retry", L"RetryFailedMirrors", settings.retryFailedMirrors ? L"1" : L"0");
     ok &= write(L"Retry", L"RetryDelaySeconds", std::to_wstring(settings.retryDelaySeconds));
     ok &= write(L"Retry", L"MaxRetriesPerMirror", std::to_wstring(settings.maxRetriesPerMirror));
+    ok &= write(L"Download", L"SegmentSizeMB", std::to_wstring(settings.segmentSizeMB));
     ok &= write(L"HTTP", L"SendUserAgent", settings.sendUserAgent ? L"1" : L"0");
     ok &= write(L"HTTP", L"UserAgent", settings.userAgent);
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_configPath.c_str());
     return ok;
 }
 
+std::wstring ReadStateString(const wchar_t* section, const std::wstring& key, const std::wstring& file) {
+    std::vector<wchar_t> buffer(32768, L'\0');
+    GetPrivateProfileStringW(section, key.c_str(), L"", buffer.data(),
+                             static_cast<DWORD>(buffer.size()), file.c_str());
+    return buffer.data();
+}
+
+bool WriteStateString(const std::wstring& file, const wchar_t* section,
+                      const std::wstring& key, const std::wstring& value) {
+    return WritePrivateProfileStringW(section, key.c_str(), value.c_str(), file.c_str()) != FALSE;
+}
+
+bool DeleteFileIfPresent(const std::wstring& path, DWORD& errorCode) {
+    if (path.empty()) return true;
+    if (DeleteFileW(path.c_str())) return true;
+    errorCode = GetLastError();
+    return errorCode == ERROR_FILE_NOT_FOUND || errorCode == ERROR_PATH_NOT_FOUND;
+}
+
+std::vector<uint64_t> ParseIndexList(const std::wstring& text) {
+    std::vector<uint64_t> result;
+    size_t start = 0;
+    while (start < text.size()) {
+        const size_t comma = text.find(L',', start);
+        const std::wstring token = text.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+        if (!token.empty()) {
+            wchar_t* end = nullptr;
+            const unsigned long long value = _wcstoui64(token.c_str(), &end, 10);
+            if (end && *end == L'\0') result.push_back(static_cast<uint64_t>(value));
+        }
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return result;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> ParsePartialSegmentList(const std::wstring& text) {
+    std::vector<std::pair<uint64_t, uint64_t>> result;
+    size_t start = 0;
+    while (start < text.size()) {
+        const size_t comma = text.find(L',', start);
+        const std::wstring token = text.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+        const size_t colon = token.find(L':');
+        if (colon != std::wstring::npos) {
+            const std::wstring indexText = token.substr(0, colon);
+            const std::wstring bytesText = token.substr(colon + 1);
+            wchar_t* indexEnd = nullptr;
+            wchar_t* bytesEnd = nullptr;
+            const unsigned long long index = _wcstoui64(indexText.c_str(), &indexEnd, 10);
+            const unsigned long long bytes = _wcstoui64(bytesText.c_str(), &bytesEnd, 10);
+            if (indexEnd && *indexEnd == L'\0' && bytesEnd && *bytesEnd == L'\0' && bytes > 0)
+                result.emplace_back(static_cast<uint64_t>(index), static_cast<uint64_t>(bytes));
+        }
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return result;
+}
+
+bool PersistDownloadsToFile(bool applicationShutdown = false) {
+    if (g_downloadsStatePath.empty()) g_downloadsStatePath = GetDownloadsStateFilePath();
+    const std::wstring tempPath = g_downloadsStatePath + L".tmp";
+    DeleteFileW(tempPath.c_str());
+    if (g_downloads.empty()) {
+        DeleteFileW(tempPath.c_str());
+        if (DeleteFileW(g_downloadsStatePath.c_str())) return true;
+        const DWORD deleteError = GetLastError();
+        return deleteError == ERROR_FILE_NOT_FOUND || deleteError == ERROR_PATH_NOT_FOUND;
+    }
+
+    const std::wstring downloadsSection = L"Downloads";
+    if (!WritePrivateProfileStringW(downloadsSection.c_str(), L"Count",
+                                    std::to_wstring(g_downloads.size()).c_str(), tempPath.c_str())) return false;
+
+    bool ok = true;
+    for (size_t i = 0; i < g_downloads.size(); ++i) {
+        const auto& download = g_downloads[i];
+        const std::wstring section = L"Download" + std::to_wstring(i);
+        std::vector<std::wstring> urls;
+        std::vector<uint64_t> completedSegments;
+        std::vector<std::pair<uint64_t, uint64_t>> partialSegments;
+        std::wstring folder, filename, finalPath, partPath, phaseName, fallbackMirror;
+        uint64_t totalSize = 0, segmentBytes = 0, fallbackBytes = 0;
+        uint64_t prefixHash = 0, middleHash = 0, suffixHash = 0;
+        bool sizeKnown = false, userPaused = false, completed = false, failed = false, cancelled = false;
+        bool cancelledKept = false, resumeFallback = false, autoResume = false;
+        bool singleMirrorOnly = false;
+        {
+            std::lock_guard lock(download->mutex);
+            folder = download->outputFolder;
+            filename = download->fileName;
+            finalPath = download->finalPath;
+            partPath = download->partPath;
+            totalSize = download->totalSize;
+            sizeKnown = download->sizeKnown;
+            fallbackBytes = download->fallbackBytes;
+            segmentBytes = download->persistentSegmentBytes ? download->persistentSegmentBytes : download->restoredSegmentBytes;
+            prefixHash = download->referencePrefixHash ? download->referencePrefixHash : download->restoredReferencePrefixHash;
+            middleHash = download->referenceMiddleHash ? download->referenceMiddleHash : download->restoredReferenceMiddleHash;
+            suffixHash = download->referenceSuffixHash ? download->referenceSuffixHash : download->restoredReferenceSuffixHash;
+            userPaused = download->userPaused;
+            completed = download->phase == DownloadPhase::Completed;
+            failed = download->phase == DownloadPhase::Failed;
+            cancelled = download->phase == DownloadPhase::Cancelled;
+            cancelledKept = download->phase == DownloadPhase::CancelledKept;
+            resumeFallback = download->resumeFallbackPending;
+            fallbackMirror = download->resumeFallbackMirrorUrl;
+            singleMirrorOnly = download->singleMirrorOnly;
+            for (const auto& mirror : download->mirrors) if (mirror->active) urls.push_back(mirror->url);
+            if (!download->segments.empty()) {
+                for (size_t index = 0; index < download->segments.size(); ++index) {
+                    const Segment& segment = download->segments[index];
+                    if (segment.state == 2) completedSegments.push_back(index);
+                    else if (segment.committedBytes > 0) partialSegments.emplace_back(index, segment.committedBytes);
+                }
+            } else {
+                completedSegments = download->restoredCompletedSegmentIndices;
+                partialSegments = download->restoredPartialSegmentBytes;
+            }
+            if (completed) phaseName = L"Completed";
+            else if (failed) phaseName = L"Failed";
+            else if (cancelled) phaseName = L"Cancelled";
+            else if (cancelledKept) phaseName = L"CancelledKept";
+            else if (userPaused || download->phase == DownloadPhase::Paused) phaseName = L"Paused";
+            else phaseName = L"Active";
+            autoResume = !urls.empty() && !completed && !failed && !cancelled && !userPaused && !cancelledKept;
+            if (applicationShutdown && !userPaused &&
+                std::find(g_shutdownResumeDownloads.begin(), g_shutdownResumeDownloads.end(), download.get()) != g_shutdownResumeDownloads.end())
+                autoResume = true;
+        }
+
+        ok &= WriteStateString(tempPath, section.c_str(), L"Folder", folder);
+        ok &= WriteStateString(tempPath, section.c_str(), L"FileName", filename);
+        ok &= WriteStateString(tempPath, section.c_str(), L"FinalPath", finalPath);
+        ok &= WriteStateString(tempPath, section.c_str(), L"PartPath", partPath);
+        ok &= WriteStateString(tempPath, section.c_str(), L"Phase", phaseName);
+        ok &= WriteStateString(tempPath, section.c_str(), L"SizeKnown", sizeKnown ? L"1" : L"0");
+        ok &= WriteStateString(tempPath, section.c_str(), L"TotalSize", std::to_wstring(totalSize));
+        ok &= WriteStateString(tempPath, section.c_str(), L"SegmentBytes", std::to_wstring(segmentBytes));
+        ok &= WriteStateString(tempPath, section.c_str(), L"ReferencePrefixHash", std::to_wstring(prefixHash));
+        ok &= WriteStateString(tempPath, section.c_str(), L"ReferenceMiddleHash", std::to_wstring(middleHash));
+        ok &= WriteStateString(tempPath, section.c_str(), L"ReferenceSuffixHash", std::to_wstring(suffixHash));
+        ok &= WriteStateString(tempPath, section.c_str(), L"FallbackBytes", std::to_wstring(fallbackBytes));
+        ok &= WriteStateString(tempPath, section.c_str(), L"SingleMirrorOnly", singleMirrorOnly ? L"1" : L"0");
+        ok &= WriteStateString(tempPath, section.c_str(), L"ResumeFallback", resumeFallback ? L"1" : L"0");
+        ok &= WriteStateString(tempPath, section.c_str(), L"ResumeFallbackMirror", fallbackMirror);
+        ok &= WriteStateString(tempPath, section.c_str(), L"UserPaused", userPaused ? L"1" : L"0");
+        ok &= WriteStateString(tempPath, section.c_str(), L"AutoResume", autoResume ? L"1" : L"0");
+        ok &= WriteStateString(tempPath, section.c_str(), L"MirrorCount", std::to_wstring(urls.size()));
+        for (size_t u = 0; u < urls.size(); ++u)
+            ok &= WriteStateString(tempPath, section.c_str(), L"Mirror" + std::to_wstring(u), urls[u]);
+
+        // Store completed ranges in 20k-character chunks to avoid INI API value limits.
+        std::wstring indexText;
+        std::vector<std::wstring> chunks;
+        for (const uint64_t index : completedSegments) {
+            const std::wstring token = (indexText.empty() ? L"" : L",") + std::to_wstring(index);
+            if (indexText.size() + token.size() > 20000) {
+                chunks.push_back(std::move(indexText));
+                indexText.clear();
+            }
+            if (!indexText.empty()) indexText += L",";
+            indexText += std::to_wstring(index);
+        }
+        if (!indexText.empty()) chunks.push_back(indexText);
+        ok &= WriteStateString(tempPath, section.c_str(), L"CompletedChunkCount", std::to_wstring(chunks.size()));
+        for (size_t c = 0; c < chunks.size(); ++c)
+            ok &= WriteStateString(tempPath, section.c_str(), L"CompletedChunk" + std::to_wstring(c), chunks[c]);
+        std::wstring partialText;
+        std::vector<std::wstring> partialChunks;
+        for (const auto& [index, bytes] : partialSegments) {
+            const std::wstring token = (partialText.empty() ? L"" : L",") +
+                std::to_wstring(index) + L":" + std::to_wstring(bytes);
+            if (partialText.size() + token.size() > 20000) {
+                partialChunks.push_back(std::move(partialText));
+                partialText.clear();
+            }
+            if (!partialText.empty()) partialText += L",";
+            partialText += std::to_wstring(index) + L":" + std::to_wstring(bytes);
+        }
+        if (!partialText.empty()) partialChunks.push_back(std::move(partialText));
+        ok &= WriteStateString(tempPath, section.c_str(), L"PartialChunkCount", std::to_wstring(partialChunks.size()));
+        for (size_t c = 0; c < partialChunks.size(); ++c)
+            ok &= WriteStateString(tempPath, section.c_str(), L"PartialChunk" + std::to_wstring(c), partialChunks[c]);
+    }
+
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, tempPath.c_str());
+    if (!ok) {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+    HANDLE file = CreateFileW(tempPath.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    const bool flushed = FlushFileBuffers(file) != FALSE;
+    CloseHandle(file);
+    if (!flushed) return false;
+    return MoveFileExW(tempPath.c_str(), g_downloadsStatePath.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
+
+void LoadDownloadsFromFile() {
+    if (g_downloadsStatePath.empty()) g_downloadsStatePath = GetDownloadsStateFilePath();
+    if (GetFileAttributesW(g_downloadsStatePath.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    const int count = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Downloads", L"Count", 0,
+                                                                         g_downloadsStatePath.c_str())), 0, 10000);
+    for (int i = 0; i < count; ++i) {
+        const std::wstring section = L"Download" + std::to_wstring(i);
+        const std::wstring folder = ReadStateString(section.c_str(), L"Folder", g_downloadsStatePath);
+        const std::wstring filename = ReadStateString(section.c_str(), L"FileName", g_downloadsStatePath);
+        if (folder.empty() || filename.empty()) continue;
+
+        const int mirrorCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"MirrorCount", 0,
+                                                                                    g_downloadsStatePath.c_str())), 0, 256);
+        std::vector<std::wstring> urls;
+        for (int u = 0; u < mirrorCount; ++u) {
+            const std::wstring url = ReadStateString(section.c_str(), L"Mirror" + std::to_wstring(u), g_downloadsStatePath);
+            if (linkforge::IsHttpUrl(url)) urls.push_back(url);
+        }
+        // Preserve the queue item even when the user removed all its mirrors.
+        // A replacement mirror can be added from the details window after restart.
+        linkforge::DownloadResumeState resume;
+        resume.partPath = ReadStateString(section.c_str(), L"PartPath", g_downloadsStatePath);
+        resume.sizeKnown = GetPrivateProfileIntW(section.c_str(), L"SizeKnown", 0, g_downloadsStatePath.c_str()) != 0;
+        resume.totalSize = _wcstoui64(ReadStateString(section.c_str(), L"TotalSize", g_downloadsStatePath).c_str(), nullptr, 10);
+        resume.segmentBytes = _wcstoui64(ReadStateString(section.c_str(), L"SegmentBytes", g_downloadsStatePath).c_str(), nullptr, 10);
+        resume.singleMirrorOnly = GetPrivateProfileIntW(section.c_str(), L"SingleMirrorOnly", 0, g_downloadsStatePath.c_str()) != 0;
+        resume.referencePrefixHash = _wcstoui64(ReadStateString(section.c_str(), L"ReferencePrefixHash", g_downloadsStatePath).c_str(), nullptr, 10);
+        resume.referenceMiddleHash = _wcstoui64(ReadStateString(section.c_str(), L"ReferenceMiddleHash", g_downloadsStatePath).c_str(), nullptr, 10);
+        resume.referenceSuffixHash = _wcstoui64(ReadStateString(section.c_str(), L"ReferenceSuffixHash", g_downloadsStatePath).c_str(), nullptr, 10);
+        resume.resumeFallbackPending = GetPrivateProfileIntW(section.c_str(), L"ResumeFallback", 0, g_downloadsStatePath.c_str()) != 0;
+        resume.resumeFallbackMirrorUrl = ReadStateString(section.c_str(), L"ResumeFallbackMirror", g_downloadsStatePath);
+        resume.wasCompleted = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"Completed";
+        resume.wasFailed = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"Failed";
+        // A crash can occur after the partial file was atomically renamed to its final
+        // name but before the next INI checkpoint. Recognize that completed file instead
+        // of downloading it again under a new duplicate filename.
+        if (!resume.wasCompleted && resume.sizeKnown && resume.totalSize > 0) {
+            std::error_code fileError;
+            const auto completedPath = std::filesystem::path(folder) / filename;
+            if (std::filesystem::exists(completedPath, fileError) && !fileError) {
+                const auto existingSize = std::filesystem::file_size(completedPath, fileError);
+                if (!fileError && existingSize == resume.totalSize) resume.wasCompleted = true;
+            }
+        }
+        resume.wasCancelled = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"Cancelled";
+        resume.wasCancelledKept = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"CancelledKept";
+        resume.wasPaused = GetPrivateProfileIntW(section.c_str(), L"UserPaused", 0, g_downloadsStatePath.c_str()) != 0;
+        const bool autoResume = GetPrivateProfileIntW(section.c_str(), L"AutoResume", 0, g_downloadsStatePath.c_str()) != 0;
+        const int chunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"CompletedChunkCount", 0,
+                                                                                  g_downloadsStatePath.c_str())), 0, 10000);
+        for (int c = 0; c < chunkCount; ++c) {
+            const auto chunk = ReadStateString(section.c_str(), L"CompletedChunk" + std::to_wstring(c), g_downloadsStatePath);
+            auto indices = ParseIndexList(chunk);
+            resume.completedSegmentIndices.insert(resume.completedSegmentIndices.end(), indices.begin(), indices.end());
+        }
+        const int partialChunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"PartialChunkCount", 0,
+                                                                                          g_downloadsStatePath.c_str())), 0, 10000);
+        for (int c = 0; c < partialChunkCount; ++c) {
+            const auto chunk = ReadStateString(section.c_str(), L"PartialChunk" + std::to_wstring(c), g_downloadsStatePath);
+            auto partials = ParsePartialSegmentList(chunk);
+            resume.partialSegmentBytes.insert(resume.partialSegmentBytes.end(), partials.begin(), partials.end());
+        }
+
+        auto download = std::make_shared<Download>(folder, filename, urls, &resume);
+        g_downloads.push_back(download);
+        if (autoResume && !urls.empty() && !resume.wasCompleted && !resume.wasFailed && !resume.wasPaused)
+            g_autoResumeDownloads.push_back(download);
+    }
+}
+
 // Forward declaration: control-creation helpers use SetFont before its definition.
 void SetFont(HWND hwnd, HFONT font = nullptr);
 
+bool IsSettingsCheckBox(HWND hwnd) {
+    if (!hwnd) return false;
+    const int id = GetDlgCtrlID(hwnd);
+    return id == ID_SETTINGS_RAMP_UP || id == ID_SETTINGS_RETRY ||
+           id == ID_SETTINGS_THROTTLE_ADAPT || id == ID_SETTINGS_USER_AGENT_ENABLE;
+}
+
+bool IsCheckBoxChecked(HWND hwnd) {
+    return hwnd && GetWindowLongPtrW(hwnd, GWLP_USERDATA) != 0;
+}
+
+void SetCheckBoxChecked(HWND hwnd, bool checked) {
+    if (!hwnd) return;
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, checked ? 1 : 0);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 HWND CreateCheckBox(HWND parent, const wchar_t* text, int id, int x, int y, int width, int height, bool checked) {
+    // Owner drawing guarantees readable white labels on the app's dark background
+    // regardless of the Windows visual-style/theme settings.
     HWND hwnd = CreateWindowExW(0, L"BUTTON", text,
-                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 x, y, width, height, parent,
                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
     SetFont(hwnd);
-    SendMessageW(hwnd, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetCheckBoxChecked(hwnd, checked);
     return hwnd;
 }
 
@@ -258,6 +574,37 @@ HWND CreateLabel(HWND parent, const wchar_t* text, int x, int y, int width, int 
                                 x, y, width, height, parent, nullptr, g_instance, nullptr);
     SetFont(hwnd);
     return hwnd;
+}
+
+constexpr LONG_PTR kSettingsLabelTag = static_cast<LONG_PTR>(0x4C465354);
+
+HWND CreateSettingsLabel(HWND parent, const wchar_t* text, int x, int y, int width, int height) {
+    // Draw settings labels ourselves instead of relying on the active Windows theme's
+    // static-control colour handling. This keeps every label readable on the dark UI.
+    HWND hwnd = CreateLabel(parent, text, x, y, width, height, SS_OWNERDRAW);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, kSettingsLabelTag);
+    return hwnd;
+}
+
+bool IsSettingsLabel(HWND hwnd) {
+    return hwnd && GetWindowLongPtrW(hwnd, GWLP_USERDATA) == kSettingsLabelTag;
+}
+
+void DrawSettingsLabel(const DRAWITEMSTRUCT* draw) {
+    if (!draw || draw->CtlType != ODT_STATIC) return;
+    FillRect(draw->hDC, &draw->rcItem, g_windowBrush);
+    SetBkMode(draw->hDC, TRANSPARENT);
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw->hwndItem, WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont = font ? SelectObject(draw->hDC, font) : nullptr;
+    // Apply the colour after selecting the control font so theme changes cannot
+    // leave owner-drawn static labels using the system's black text.
+    SetTextColor(draw->hDC, RGB(255, 255, 255));
+    const std::wstring label = GetWindowTextString(draw->hwndItem);
+    RECT textRect = draw->rcItem;
+    InflateRect(&textRect, -1, 0);
+    DrawTextW(draw->hDC, label.c_str(), -1, &textRect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (oldFont) SelectObject(draw->hDC, oldFont);
 }
 
 HWND CreateDarkButton(HWND parent, const wchar_t* text, int id, int x, int y, int width, int height) {
@@ -341,6 +688,55 @@ void DrawButton(const DRAWITEMSTRUCT* draw) {
     if (oldFont) SelectObject(draw->hDC, oldFont);
 }
 
+void DrawCheckBox(const DRAWITEMSTRUCT* draw) {
+    if (!draw || draw->CtlType != ODT_BUTTON) return;
+    const bool checked = IsCheckBoxChecked(draw->hwndItem);
+    const bool disabled = (draw->itemState & ODS_DISABLED) != 0;
+    const bool focused = (draw->itemState & ODS_FOCUS) != 0;
+    const bool pressed = (draw->itemState & ODS_SELECTED) != 0;
+
+    FillRect(draw->hDC, &draw->rcItem, g_windowBrush);
+
+    RECT box{draw->rcItem.left + 2, draw->rcItem.top + (draw->rcItem.bottom - draw->rcItem.top - 16) / 2,
+             draw->rcItem.left + 18, draw->rcItem.top + (draw->rcItem.bottom - draw->rcItem.top - 16) / 2 + 16};
+    HBRUSH boxBrush = CreateSolidBrush(pressed ? RGB(31, 36, 45) : kInputBg);
+    FillRect(draw->hDC, &box, boxBrush);
+    DeleteObject(boxBrush);
+    HBRUSH frameBrush = CreateSolidBrush(disabled ? RGB(65, 68, 75) : kBorder);
+    FrameRect(draw->hDC, &box, frameBrush);
+    DeleteObject(frameBrush);
+
+    if (checked) {
+        HPEN checkPen = CreatePen(PS_SOLID, 2, disabled ? kMutedText : RGB(110, 178, 255));
+        HGDIOBJ oldPen = SelectObject(draw->hDC, checkPen);
+        const int x = box.left;
+        const int y = box.top;
+        MoveToEx(draw->hDC, x + 3, y + 8, nullptr);
+        LineTo(draw->hDC, x + 7, y + 12);
+        LineTo(draw->hDC, x + 14, y + 3);
+        SelectObject(draw->hDC, oldPen);
+        DeleteObject(checkPen);
+    }
+
+    RECT textRect = draw->rcItem;
+    textRect.left += 26;
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw->hwndItem, WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont = font ? SelectObject(draw->hDC, font) : nullptr;
+    SetBkMode(draw->hDC, TRANSPARENT);
+    // Force a bright caption colour after selecting the font; do not inherit the
+    // Windows theme's default black button text on the dark settings surface.
+    SetTextColor(draw->hDC, disabled ? RGB(190, 194, 202) : RGB(255, 255, 255));
+    const std::wstring label = GetWindowTextString(draw->hwndItem);
+    DrawTextW(draw->hDC, label.c_str(), -1, &textRect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (oldFont) SelectObject(draw->hDC, oldFont);
+    if (focused) {
+        RECT focusRect = textRect;
+        InflateRect(&focusRect, -1, -2);
+        DrawFocusRect(draw->hDC, &focusRect);
+    }
+}
+
 std::wstring FormatBytes(uint64_t bytes) {
     const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
     double value = static_cast<double>(bytes);
@@ -378,9 +774,10 @@ std::wstring FormatDuration(double seconds) {
 }
 
 uint64_t GetProgressBytesLocked(const Download& download) {
-    if (download.phase == DownloadPhase::DownloadingFallback) return download.fallbackBytes;
+    if (!download.parallelMode && download.phase != DownloadPhase::Completed) return download.fallbackBytes;
     uint64_t result = download.completedBytes;
     for (const auto& segment : download.segments) {
+        if (segment.state != 2) result += segment.committedBytes;
         if (segment.state == 1) result += segment.inFlightBytes;
     }
     if (download.phase == DownloadPhase::Completed && download.sizeKnown) return download.totalSize;
@@ -391,10 +788,11 @@ uint64_t GetProgressBytesLocked(const Download& download) {
 std::wstring GetEtaLocked(const Download& download) {
     if (download.phase == DownloadPhase::Completed || download.phase == DownloadPhase::Cancelled ||
         download.phase == DownloadPhase::CancelledKept || download.phase == DownloadPhase::Failed ||
-        !download.sizeKnown || download.speedBps < 1.0) return L"—";
+        download.phase == DownloadPhase::Paused || download.userPaused ||
+        !download.sizeKnown || download.etaSpeedBps < 1.0) return L"—";
     const uint64_t current = GetProgressBytesLocked(download);
     if (current >= download.totalSize) return L"—";
-    return FormatDuration(static_cast<double>(download.totalSize - current) / download.speedBps);
+    return FormatDuration(static_cast<double>(download.totalSize - current) / download.etaSpeedBps);
 }
 
 std::wstring GetSizeTextLocked(const Download& download) {
@@ -415,17 +813,53 @@ void SampleSpeeds() {
     for (const auto& download : g_downloads) {
         std::lock_guard lock(download->mutex);
         if (download->terminal && download->endTransferTick == 0) download->endTransferTick = now;
-        if (download->speedSampleTick == 0) {
+        const bool pausedForEta = download->userPaused ||
+            download->phase == DownloadPhase::Pausing || download->phase == DownloadPhase::Paused;
+
+        if (pausedForEta) {
+            // Do not let time spent paused contaminate the next ETA sample window.
+            download->etaSpeedSamples.clear();
+            download->etaSpeedBps = 0.0;
+            download->speedBps = 0.0;
+            download->speedSampleTick = 0;
+        } else if (download->speedSampleTick == 0) {
             download->speedSampleTick = now;
             download->lastSpeedSampleBytes = download->networkBytes;
+            download->etaSpeedSamples.emplace_back(now, GetProgressBytesLocked(*download));
         } else if (now > download->speedSampleTick) {
             const uint64_t elapsed = now - download->speedSampleTick;
             if (elapsed >= 500) {
-                const uint64_t delta = download->networkBytes >= download->lastSpeedSampleBytes
+                // Keep the Speed column responsive, but calculate ETA separately from
+                // actual progress so retransmitted bytes do not make the ETA optimistic.
+                const uint64_t networkDelta = download->networkBytes >= download->lastSpeedSampleBytes
                     ? download->networkBytes - download->lastSpeedSampleBytes : 0;
-                download->speedBps = static_cast<double>(delta) * 1000.0 / static_cast<double>(elapsed);
+                download->speedBps = static_cast<double>(networkDelta) * 1000.0 / static_cast<double>(elapsed);
                 download->lastSpeedSampleBytes = download->networkBytes;
                 download->speedSampleTick = now;
+
+                const uint64_t progressBytes = GetProgressBytesLocked(*download);
+                auto& history = download->etaSpeedSamples;
+                if (!history.empty() && progressBytes < history.back().second) {
+                    // A retry/recovery may legitimately reset progress. Start a fresh
+                    // averaging window rather than calculating a negative/invalid rate.
+                    history.clear();
+                }
+                history.emplace_back(now, progressBytes);
+                while (history.size() > 2 && now - history.front().first > kEtaAverageWindowMs)
+                    history.pop_front();
+
+                if (history.size() >= 2) {
+                    const uint64_t windowMs = history.back().first - history.front().first;
+                    const uint64_t progressDelta = history.back().second - history.front().second;
+                    if (windowMs >= kEtaMinimumWindowMs) {
+                        download->etaSpeedBps = static_cast<double>(progressDelta) * 1000.0 /
+                                                static_cast<double>(windowMs);
+                    } else {
+                        download->etaSpeedBps = 0.0;
+                    }
+                } else {
+                    download->etaSpeedBps = 0.0;
+                }
             }
         }
         for (const auto& mirror : download->mirrors) {
@@ -464,11 +898,15 @@ void AddColumn(HWND list, int index, const wchar_t* title, int width) {
     ListView_InsertColumn(list, index, &column);
 }
 
-void SetListCell(HWND list, int row, int column, const std::wstring& text) {
+bool SetListCell(HWND list, int row, int column, const std::wstring& text) {
+    wchar_t current[8192]{};
+    ListView_GetItemText(list, row, column, current, static_cast<int>(std::size(current)));
+    if (text == current) return false;
     LVITEMW item{};
     item.iSubItem = column;
     item.pszText = const_cast<LPWSTR>(text.c_str());
     ListView_SetItemText(list, row, column, item.pszText);
+    return true;
 }
 
 void UpdateMainList() {
@@ -477,6 +915,7 @@ void UpdateMainList() {
     if (oldCount != static_cast<int>(g_downloads.size())) {
         const int selected = ListView_GetNextItem(g_mainList, -1, LVNI_SELECTED);
         ListView_DeleteAllItems(g_mainList);
+        g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
         for (size_t i = 0; i < g_downloads.size(); ++i) {
             std::wstring name;
             {
@@ -490,34 +929,69 @@ void UpdateMainList() {
             item.lParam = reinterpret_cast<LPARAM>(g_downloads[i].get());
             ListView_InsertItem(g_mainList, &item);
         }
-        if (selected >= 0 && selected < static_cast<int>(g_downloads.size())) {
+        if (selected >= 0 && selected < static_cast<int>(g_downloads.size()))
             ListView_SetItemState(g_mainList, selected, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-        }
     }
 
     int activeCount = 0;
+    int pausedCount = 0;
     int completedCount = 0;
     double speed = 0.0;
     for (size_t i = 0; i < g_downloads.size(); ++i) {
         const auto& download = g_downloads[i];
         std::lock_guard lock(download->mutex);
-        if (!download->terminal) ++activeCount;
+        const int row = static_cast<int>(i);
+        if (!download->terminal && !download->userPaused) ++activeCount;
+        if (download->userPaused || download->phase == DownloadPhase::Paused) ++pausedCount;
         if (download->phase == DownloadPhase::Completed) ++completedCount;
         speed += download->speedBps;
-        SetListCell(g_mainList, static_cast<int>(i), 0, download->fileName);
-        SetListCell(g_mainList, static_cast<int>(i), 1, GetProgressTextLocked(*download));
-        SetListCell(g_mainList, static_cast<int>(i), 2, GetSizeTextLocked(*download));
-        SetListCell(g_mainList, static_cast<int>(i), 3, FormatSpeed(download->speedBps));
-        SetListCell(g_mainList, static_cast<int>(i), 4, GetEtaLocked(*download));
-        SetListCell(g_mainList, static_cast<int>(i), 5, download->statusText);
+        // LVM_SETITEMTEXT invalidates the individual subitem. Avoid repainting the
+        // whole row on every statistics tick: that caused visible hover/text flicker.
+        SetListCell(g_mainList, row, 0, download->fileName);
+        // Column 1 is fully custom-drawn as a progress bar. Updating its hidden
+        // list-view text every timer tick would invalidate it unnecessarily.
+        SetListCell(g_mainList, row, 2, GetSizeTextLocked(*download));
+        SetListCell(g_mainList, row, 3, FormatSpeed(download->speedBps));
+        SetListCell(g_mainList, row, 4, GetEtaLocked(*download));
+        const std::wstring visibleStatus = download->userPaused
+            ? (download->pauseSettled ? L"Paused" : L"Pausing - flushing active ranges")
+            : download->statusText;
+        SetListCell(g_mainList, row, 5, visibleStatus);
+
+        const uint64_t progressBytes = GetProgressBytesLocked(*download);
+        if (i >= g_lastProgressBytes.size()) g_lastProgressBytes.resize(i + 1, UINT64_MAX);
+        if (g_lastProgressBytes[i] != progressBytes) {
+            g_lastProgressBytes[i] = progressBytes;
+            RECT progressRect{};
+            if (ListView_GetSubItemRect(g_mainList, row, 1, LVIR_BOUNDS, &progressRect))
+                InvalidateRect(g_mainList, &progressRect, FALSE);
+        }
+    }
+
+    const int selected = ListView_GetNextItem(g_mainList, -1, LVNI_SELECTED);
+    if (g_pauseButton) {
+        bool paused = false;
+        bool pausing = false;
+        bool canPause = false;
+        if (selected >= 0 && selected < static_cast<int>(g_downloads.size())) {
+            std::lock_guard lock(g_downloads[static_cast<size_t>(selected)]->mutex);
+            const auto& download = *g_downloads[static_cast<size_t>(selected)];
+            pausing = download.userPaused && !download.pauseSettled;
+            paused = download.userPaused && download.pauseSettled;
+            canPause = !download.terminal || paused || pausing;
+        }
+        SetWindowTextW(g_pauseButton, pausing ? L"Pausing..." : (paused ? L"Resume" : L"Pause"));
+        // Do not let a fast second click clear the pause request before all range
+        // workers have flushed their bytes and committed their segment offsets.
+        EnableWindow(g_pauseButton, canPause && !pausing ? TRUE : FALSE);
     }
     if (g_statusText) {
         const std::wstring status = std::to_wstring(activeCount) + L" active   •   " +
+                                    std::to_wstring(pausedCount) + L" paused   •   " +
                                     std::to_wstring(completedCount) + L" completed   •   " +
                                     FormatSpeed(speed) + L" total";
         SetWindowTextW(g_statusText, status.c_str());
     }
-    InvalidateRect(g_mainList, nullptr, FALSE);
 }
 
 void RefreshDetails(DetailsContext* context) {
@@ -536,8 +1010,25 @@ void RefreshDetails(DetailsContext* context) {
         const std::wstring average = download->firstTransferTick && averageEndTick > download->firstTransferTick
             ? FormatSpeed(static_cast<double>(download->networkBytes) * 1000.0 / static_cast<double>(averageEndTick - download->firstTransferTick))
             : L"—";
-        summary = GetProgressTextLocked(*download) + L"   ·   " + GetSizeTextLocked(*download) +
-                  L"   ·   Current " + FormatSpeed(download->speedBps) + L"   ·   Avg " + average + L"   ·   " + download->statusText;
+        const size_t activeMirrors = static_cast<size_t>(std::count_if(download->mirrors.begin(), download->mirrors.end(),
+            [](const auto& mirror) { return mirror->active; }));
+        const size_t partialChunks = static_cast<size_t>(std::count_if(download->segments.begin(), download->segments.end(),
+            [](const Segment& segment) { return segment.state != 2 && segment.committedBytes > 0; }));
+        const uint64_t chunkBytes = download->persistentSegmentBytes ? download->persistentSegmentBytes : download->restoredSegmentBytes;
+        const std::wstring chunkSizeText = chunkBytes ? FormatBytes(chunkBytes) : L"not set";
+        std::wstring shortStatus = download->statusText;
+        if (shortStatus.size() > 30) shortStatus = shortStatus.substr(0, 27) + L"...";
+        const std::wstring summaryFirstRow =
+            L"Mirrors: " + std::to_wstring(activeMirrors) + L"/" + std::to_wstring(download->mirrors.size()) + L" active" +
+            L"   ·   " + (download->singleMirrorOnly ? L"Single mirror" : L"Parallel mirrors") +
+            L"   ·   Chunk: " + chunkSizeText +
+            L"   ·   Chunks: " + std::to_wstring(download->completedSegments) + L"/" + std::to_wstring(download->segments.size()) + L" complete";
+        const std::wstring summarySecondRow =
+            L"Active: " + std::to_wstring(download->activeRequests) + L"   ·   Partial: " + std::to_wstring(partialChunks) +
+            L"   ·   Progress: " + GetProgressTextLocked(*download) + L" (" + GetSizeTextLocked(*download) + L")" +
+            L"   ·   Current: " + FormatSpeed(download->speedBps) + L"   ·   Avg: " + average +
+            L"   ·   " + shortStatus;
+        summary = summaryFirstRow + L"\r\n" + summarySecondRow;
         terminal = download->terminal;
         canRetry = download->phase == DownloadPhase::Failed || download->phase == DownloadPhase::Cancelled ||
                    download->phase == DownloadPhase::CancelledKept;
@@ -574,14 +1065,15 @@ void RefreshDetails(DetailsContext* context) {
     for (size_t i = 0; i < mirrors.size(); ++i) {
         const auto& mirror = mirrors[i];
         std::lock_guard lock(download->mutex);
-        SetListCell(context->list, static_cast<int>(i), 0, mirror->url);
-        SetListCell(context->list, static_cast<int>(i), 1, FormatSpeed(mirror->speedBps));
+        const int row = static_cast<int>(i);
+        SetListCell(context->list, row, 0, mirror->url);
+        SetListCell(context->list, row, 1, FormatSpeed(mirror->speedBps));
         const std::wstring average = mirror->firstTransferTick && averageEndTick > mirror->firstTransferTick
             ? FormatSpeed(static_cast<double>(mirror->networkBytes) * 1000.0 / static_cast<double>(averageEndTick - mirror->firstTransferTick))
             : L"—";
-        SetListCell(context->list, static_cast<int>(i), 2, average);
-        SetListCell(context->list, static_cast<int>(i), 3, FormatBytes(mirror->networkBytes));
-        SetListCell(context->list, static_cast<int>(i), 4, mirror->lastHttpStatus ? std::to_wstring(mirror->lastHttpStatus) : L"—");
+        SetListCell(context->list, row, 2, average);
+        SetListCell(context->list, row, 3, FormatBytes(mirror->networkBytes));
+        SetListCell(context->list, row, 4, mirror->lastHttpStatus ? std::to_wstring(mirror->lastHttpStatus) : L"—");
         std::wstring mode = mirror->rangeCapable && !mirror->rangeFailed ? L"Ranges " : L"Full-file only";
         if (mirror->rangeCapable && !mirror->rangeFailed) {
             const int effectiveLimit = mirror->throttleConnectionLimit > 0
@@ -589,12 +1081,14 @@ void RefreshDetails(DetailsContext* context) {
                 : currentSettings.maxConnectionsPerMirror;
             mode += std::to_wstring(mirror->activeRequests) + L"/" + std::to_wstring(effectiveLimit);
         }
-        SetListCell(context->list, static_cast<int>(i), 5, mode);
+        SetListCell(context->list, row, 5, mode);
         std::wstring status = mirror->active ? mirror->state : L"Removed";
         if (!mirror->lastError.empty() && mirror->active) status += L" — " + mirror->lastError;
-        SetListCell(context->list, static_cast<int>(i), 6, status);
+        SetListCell(context->list, row, 6, status);
+        const std::wstring chunkStats = std::to_wstring(mirror->completedChunks) + L" / " +
+            std::to_wstring(mirror->activeRequests) + L" / " + std::to_wstring(mirror->failedChunks);
+        SetListCell(context->list, row, 7, chunkStats);
     }
-    InvalidateRect(context->list, nullptr, FALSE);
 }
 
 LRESULT HandleListCustomDraw(HWND hwnd, LPARAM lParam, bool mainList) {
@@ -602,72 +1096,88 @@ LRESULT HandleListCustomDraw(HWND hwnd, LPARAM lParam, bool mainList) {
     switch (draw->nmcd.dwDrawStage) {
     case CDDS_PREPAINT:
         return CDRF_NOTIFYITEMDRAW;
+
     case CDDS_ITEMPREPAINT:
+        // Let the common control track and invalidate individual subitems. Painting
+        // the whole row from ITEMPREPAINT caused unnecessary redraws when the pointer
+        // entered or left a row, which looked like text blinking.
         return CDRF_NOTIFYSUBITEMDRAW;
-    case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
+
+    case CDDS_SUBITEM | CDDS_ITEMPREPAINT: {
         const int row = static_cast<int>(draw->nmcd.dwItemSpec);
         const int column = draw->iSubItem;
-        RECT rect{};
-        if (!ListView_GetSubItemRect(hwnd, row, column, LVIR_BOUNDS, &rect)) return CDRF_DODEFAULT;
-        const bool selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
-        const COLORREF background = selected ? RGB(46, 66, 91) : kPanelBg;
-        HBRUSH brush = CreateSolidBrush(background);
-        FillRect(draw->nmcd.hdc, &rect, brush);
-        DeleteObject(brush);
+        if (row < 0 || row >= ListView_GetItemCount(hwnd) || column < 0 ||
+            column >= Header_GetItemCount(ListView_GetHeader(hwnd))) return CDRF_DODEFAULT;
 
-        if (mainList && column == 1 && row >= 0 && row < static_cast<int>(g_downloads.size())) {
-            const auto& download = g_downloads[static_cast<size_t>(row)];
-            uint64_t progress = 0, total = 0;
-            bool known = false;
-            DownloadPhase phase;
-            {
-                std::lock_guard lock(download->mutex);
-                progress = GetProgressBytesLocked(*download);
-                total = download->totalSize;
-                known = download->sizeKnown && total > 0;
-                phase = download->phase;
-            }
-            RECT bar = rect;
-            InflateRect(&bar, -10, -7);
-            const int labelWidth = 44;
-            bar.right -= labelWidth;
-            HBRUSH track = CreateSolidBrush(RGB(47, 52, 63));
-            FillRect(draw->nmcd.hdc, &bar, track);
-            DeleteObject(track);
-            if (known) {
-                const int width = bar.right - bar.left;
-                int fillWidth = static_cast<int>((static_cast<double>(std::min(progress, total)) / static_cast<double>(total)) * width);
-                if (phase == DownloadPhase::Completed) fillWidth = width;
-                if (fillWidth > 0) {
-                    RECT fill = bar;
-                    fill.right = fill.left + fillWidth;
-                    HBRUSH color = CreateSolidBrush(phase == DownloadPhase::Failed ? kRed : kGreen);
-                    FillRect(draw->nmcd.hdc, &fill, color);
-                    DeleteObject(color);
-                }
-            }
-            std::wstring label;
-            {
-                std::lock_guard lock(download->mutex);
-                label = GetProgressTextLocked(*download);
-            }
-            RECT textRect = rect;
-            textRect.left = bar.right + 4;
-            SetBkMode(draw->nmcd.hdc, TRANSPARENT);
-            SetTextColor(draw->nmcd.hdc, kText);
-            DrawTextW(draw->nmcd.hdc, label.c_str(), -1, &textRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        } else {
-            wchar_t textBuffer[8192]{};
-            ListView_GetItemText(hwnd, row, column, textBuffer, static_cast<int>(std::size(textBuffer)));
-            RECT textRect = rect;
-            InflateRect(&textRect, -8, 0);
-            SetBkMode(draw->nmcd.hdc, TRANSPARENT);
-            SetTextColor(draw->nmcd.hdc, selected ? RGB(255, 255, 255) : kText);
-            HFONT font = reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0));
-            HGDIOBJ oldFont = font ? SelectObject(draw->nmcd.hdc, font) : nullptr;
-            DrawTextW(draw->nmcd.hdc, textBuffer, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            if (oldFont) SelectObject(draw->nmcd.hdc, oldFont);
+        const bool selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
+        draw->clrText = RGB(255, 255, 255);
+        draw->clrTextBk = selected ? RGB(46, 66, 91) : kPanelBg;
+
+        // Let the common control paint ordinary text cells. Manually painting every
+        // cell and returning CDRF_SKIPDEFAULT makes hover/selection transitions cause
+        // redundant invalidate-and-redraw cycles (visible as brief text blinking).
+        // Only the progress-bar cell needs custom rendering.
+        if (!mainList || column != 1 || row >= static_cast<int>(g_downloads.size())) {
+            // These cells use the list-view's own configured foreground/background
+            // colours and native painter. Returning DODEFAULT avoids an unnecessary
+            // custom-font repaint during hot-track/selection transitions.
+            return CDRF_DODEFAULT;
         }
+
+        RECT cell{};
+        if (!ListView_GetSubItemRect(hwnd, row, column, LVIR_BOUNDS, &cell)) return CDRF_DODEFAULT;
+
+        const auto& download = g_downloads[static_cast<size_t>(row)];
+        uint64_t progress = 0;
+        uint64_t total = 0;
+        bool known = false;
+        DownloadPhase phase;
+        std::wstring label;
+        {
+            std::lock_guard lock(download->mutex);
+            progress = GetProgressBytesLocked(*download);
+            total = download->totalSize;
+            known = download->sizeKnown && total > 0;
+            phase = download->phase;
+            label = GetProgressTextLocked(*download);
+        }
+
+        HBRUSH backgroundBrush = CreateSolidBrush(draw->clrTextBk);
+        FillRect(draw->nmcd.hdc, &cell, backgroundBrush);
+        DeleteObject(backgroundBrush);
+        HFONT font = reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0));
+        HGDIOBJ oldFont = font ? SelectObject(draw->nmcd.hdc, font) : nullptr;
+
+        RECT bar = cell;
+        InflateRect(&bar, -10, -7);
+        const int labelWidth = 44;
+        bar.right = std::max(bar.left, bar.right - labelWidth);
+        HBRUSH track = CreateSolidBrush(RGB(47, 52, 63));
+        FillRect(draw->nmcd.hdc, &bar, track);
+        DeleteObject(track);
+
+        if (known) {
+            const int width = bar.right - bar.left;
+            int fillWidth = static_cast<int>((static_cast<double>(std::min(progress, total)) /
+                                               static_cast<double>(total)) * width);
+            if (phase == DownloadPhase::Completed) fillWidth = width;
+            fillWidth = std::clamp(fillWidth, 0, width);
+            if (fillWidth > 0) {
+                RECT fill = bar;
+                fill.right = fill.left + fillWidth;
+                HBRUSH fillBrush = CreateSolidBrush(phase == DownloadPhase::Failed ? kRed : kGreen);
+                FillRect(draw->nmcd.hdc, &fill, fillBrush);
+                DeleteObject(fillBrush);
+            }
+        }
+
+        RECT labelRect = cell;
+        labelRect.left = bar.right + 4;
+        SetBkMode(draw->nmcd.hdc, TRANSPARENT);
+        SetTextColor(draw->nmcd.hdc, RGB(255, 255, 255));
+        DrawTextW(draw->nmcd.hdc, label.c_str(), -1, &labelRect,
+                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        if (oldFont) SelectObject(draw->nmcd.hdc, oldFont);
         return CDRF_SKIPDEFAULT;
     }
     default:
@@ -704,9 +1214,19 @@ LRESULT CALLBACK TextDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             CreateLabel(hwnd, L"Filename (optional — automatically detected from the first URL if empty)",
                         22, 472, 670, 22);
             state->filenameEdit = CreateEdit(hwnd, ID_DIALOG_FILENAME, 22, 496, 690, 30);
+            CreateLabel(hwnd, L"Download mode", 22, 535, 160, 22);
+            state->modeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                22, 558, 690, 120, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DIALOG_MODE)),
+                g_instance, nullptr);
+            SetFont(state->modeCombo);
+            SendMessageW(state->modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Parallel mirrors — use all compatible mirrors (recommended)"));
+            SendMessageW(state->modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Single mirror only — use one URL at a time (sequential)"));
+            SendMessageW(state->modeCombo, CB_SETCURSEL, 0, 0);
         }
-        CreateDarkButton(hwnd, state->mirrorMode ? L"Add mirrors" : L"Add download", ID_DIALOG_OK, 490, 540, 108, 34);
-        CreateDarkButton(hwnd, L"Cancel", ID_DIALOG_CANCEL, 604, 540, 108, 34);
+        const int buttonY = state->mirrorMode ? 540 : 625;
+        CreateDarkButton(hwnd, state->mirrorMode ? L"Add mirrors" : L"Add download", ID_DIALOG_OK, 490, buttonY, 108, 34);
+        CreateDarkButton(hwnd, L"Cancel", ID_DIALOG_CANCEL, 604, buttonY, 108, 34);
         return 0;
     }
     case WM_COMMAND: {
@@ -741,6 +1261,7 @@ LRESULT CALLBACK TextDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                     return 0;
                 }
                 if (state->filename.empty()) state->filename = linkforge::MakeFileNameFromUrl(urls.front());
+                state->singleMirrorOnly = SendMessageW(state->modeCombo, CB_GETCURSEL, 0, 0) == 1;
             }
             state->urls = std::move(urls);
             state->accepted = true;
@@ -749,10 +1270,12 @@ LRESULT CALLBACK TextDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         }
         break;
     }
-    case WM_CTLCOLORSTATIC: {
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
         HDC dc = reinterpret_cast<HDC>(wParam);
-        SetTextColor(dc, kText);
+        SetTextColor(dc, RGB(255, 255, 255));
         SetBkColor(dc, kWindowBg);
+        SetBkMode(dc, TRANSPARENT);
         return reinterpret_cast<LRESULT>(g_windowBrush);
     }
     case WM_CTLCOLOREDIT: {
@@ -761,9 +1284,12 @@ LRESULT CALLBACK TextDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         SetBkColor(dc, kInputBg);
         return reinterpret_cast<LRESULT>(g_inputBrush);
     }
-    case WM_DRAWITEM:
-        DrawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+    case WM_DRAWITEM: {
+        auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (draw && IsSettingsCheckBox(draw->hwndItem)) DrawCheckBox(draw);
+        else DrawButton(draw);
         return TRUE;
+    }
     case WM_ERASEBKGND: {
         RECT rect{};
         GetClientRect(hwnd, &rect);
@@ -778,7 +1304,8 @@ LRESULT CALLBACK TextDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
 }
 
 bool ShowTextDialog(HWND owner, bool mirrorMode, const std::wstring& initialFolder,
-                    std::vector<std::wstring>& urls, std::wstring& folder, std::wstring& filename) {
+                    std::vector<std::wstring>& urls, std::wstring& folder, std::wstring& filename,
+                    bool* singleMirrorOnly = nullptr) {
     TextDialogState state;
     state.owner = owner;
     state.mirrorMode = mirrorMode;
@@ -787,7 +1314,10 @@ bool ShowTextDialog(HWND owner, bool mirrorMode, const std::wstring& initialFold
     HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
                                   kTextDialogClass,
                                   mirrorMode ? L"Add mirrors — LinkForge" : L"Add file download — LinkForge",
-                                  style, CW_USEDEFAULT, CW_USEDEFAULT, 760, 625, owner, nullptr,
+                                  // The window height includes the non-client title bar and borders.
+                                  // The download-mode combo and bottom action buttons need a taller
+                                  // client area than the original dialog provided.
+                                  style, CW_USEDEFAULT, CW_USEDEFAULT, 760, mirrorMode ? 625 : 730, owner, nullptr,
                                   g_instance, &state);
     if (!dialog) return false;
     CenterOver(dialog, owner);
@@ -807,6 +1337,7 @@ bool ShowTextDialog(HWND owner, bool mirrorMode, const std::wstring& initialFold
     urls = std::move(state.urls);
     folder = std::move(state.folder);
     filename = std::move(state.filename);
+    if (singleMirrorOnly) *singleMirrorOnly = state.singleMirrorOnly;
     return true;
 }
 
@@ -814,12 +1345,14 @@ void AddDownload(HWND owner) {
     std::vector<std::wstring> urls;
     std::wstring folder = GetDownloadsFolder();
     std::wstring filename;
-    if (!ShowTextDialog(owner, false, folder, urls, folder, filename)) return;
+    bool singleMirrorOnly = false;
+    if (!ShowTextDialog(owner, false, folder, urls, folder, filename, &singleMirrorOnly)) return;
     if (filename.empty()) filename = linkforge::MakeFileNameFromUrl(urls.front());
-    auto download = std::make_shared<Download>(folder, filename, urls);
+    auto download = std::make_shared<Download>(folder, filename, urls, nullptr, singleMirrorOnly);
     g_downloads.push_back(download);
     download->Start();
     UpdateMainList();
+    PersistDownloadsToFile();
 }
 
 int GetSelectedDownloadIndex() {
@@ -882,6 +1415,7 @@ void RemoveSelectedMirror(DetailsContext* context) {
     if (!context->download->RemoveMirror(static_cast<int>(item.lParam))) {
         MessageBoxW(context->hwnd, L"That mirror is already removed or unavailable.", L"LinkForge", MB_OK | MB_ICONINFORMATION);
     }
+    PersistDownloadsToFile();
     RefreshDetails(context);
 }
 
@@ -903,21 +1437,23 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             filename = context->download->fileName;
         }
         context->fileLabel = CreateLabel(hwnd, filename.c_str(), 18, 14, 1000, 30, SS_OWNERDRAW);
-        context->summaryLabel = CreateLabel(hwnd, L"", 18, 48, 1000, 24);
+        // Two explicit summary rows keep file statistics readable at the minimum window width.
+        context->summaryLabel = CreateLabel(hwnd, L"", 18, 48, 1000, 44);
         context->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                         WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                                        18, 82, 1028, 390, hwnd,
+                                        18, 100, 1028, 372, hwnd,
                                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DETAIL_LIST)),
                                         g_instance, nullptr);
         SetFont(context->list);
         ConfigureListView(context->list);
-        AddColumn(context->list, 0, L"Mirror URL", 355);
-        AddColumn(context->list, 1, L"Current speed", 95);
-        AddColumn(context->list, 2, L"Average speed", 95);
-        AddColumn(context->list, 3, L"Received", 105);
-        AddColumn(context->list, 4, L"HTTP", 60);
-        AddColumn(context->list, 5, L"Mode / connections", 140);
-        AddColumn(context->list, 6, L"Status / error", 175);
+        AddColumn(context->list, 0, L"Mirror URL", 270);
+        AddColumn(context->list, 1, L"Current speed", 85);
+        AddColumn(context->list, 2, L"Average speed", 85);
+        AddColumn(context->list, 3, L"Received", 95);
+        AddColumn(context->list, 4, L"HTTP", 55);
+        AddColumn(context->list, 5, L"Mode / connections", 105);
+        AddColumn(context->list, 6, L"Status / error", 140);
+        AddColumn(context->list, 7, L"Chunks done / active / failed", 150);
         context->addButton = CreateDarkButton(hwnd, L"＋ Add mirrors", ID_DETAIL_ADD, 18, 490, 138, 34);
         context->removeButton = CreateDarkButton(hwnd, L"Remove mirror", ID_DETAIL_REMOVE, 164, 490, 130, 34);
         context->retryButton = CreateDarkButton(hwnd, L"Retry download", ID_DETAIL_RETRY, 302, 490, 130, 34);
@@ -939,8 +1475,8 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         const int width = client.right - client.left;
         const int height = client.bottom - client.top;
         MoveWindow(context->fileLabel, 18, 14, width - 36, 30, TRUE);
-        MoveWindow(context->summaryLabel, 18, 48, width - 36, 24, TRUE);
-        MoveWindow(context->list, 18, 82, width - 36, height - 158, TRUE);
+        MoveWindow(context->summaryLabel, 18, 48, width - 36, 44, TRUE);
+        MoveWindow(context->list, 18, 100, width - 36, height - 176, TRUE);
         MoveWindow(context->addButton, 18, height - 58, 138, 34, TRUE);
         MoveWindow(context->removeButton, 164, height - 58, 130, 34, TRUE);
         MoveWindow(context->retryButton, 302, height - 58, 130, 34, TRUE);
@@ -958,6 +1494,7 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             std::wstring folder, filename;
             if (ShowTextDialog(hwnd, true, L"", urls, folder, filename)) {
                 context->download->AddMirrors(urls);
+                PersistDownloadsToFile();
                 RefreshDetails(context);
             }
             return 0;
@@ -1002,10 +1539,12 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return TRUE;
         }
         break;
-    case WM_CTLCOLORSTATIC: {
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
         HDC dc = reinterpret_cast<HDC>(wParam);
-        SetTextColor(dc, kText);
+        SetTextColor(dc, RGB(255, 255, 255));
         SetBkColor(dc, kWindowBg);
+        SetBkMode(dc, TRANSPARENT);
         return reinterpret_cast<LRESULT>(g_windowBrush);
     }
     case WM_CTLCOLOREDIT: {
@@ -1043,38 +1582,43 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
     switch (message) {
     case WM_CREATE: {
         if (!context) return -1;
-        CreateLabel(hwnd, L"Download settings", 24, 18, 500, 32);
-        CreateLabel(hwnd, L"These settings are saved to LinkForge.ini beside the executable.", 26, 50, 680, 22);
-        CreateLabel(hwnd, L"CONNECTION LIMITS", 26, 86, 300, 20);
-        CreateLabel(hwnd, L"Maximum simultaneous connections across all downloads", 28, 116, 500, 24);
+        CreateSettingsLabel(hwnd, L"Download settings", 24, 18, 500, 32);
+        CreateSettingsLabel(hwnd, L"These settings are saved to LinkForge.ini beside the executable.", 26, 50, 680, 22);
+        CreateSettingsLabel(hwnd, L"CONNECTION LIMITS", 26, 86, 300, 20);
+        CreateSettingsLabel(hwnd, L"Maximum simultaneous connections across all downloads", 28, 116, 500, 24);
         context->maxTotalEdit = CreateEdit(hwnd, ID_SETTINGS_MAX_TOTAL, 590, 111, 110, 28, ES_NUMBER);
         SetWindowTextW(context->maxTotalEdit, std::to_wstring(context->settings.maxTotalConnections).c_str());
-        CreateLabel(hwnd, L"Maximum parallel connections to each mirror", 28, 153, 500, 24);
+        CreateSettingsLabel(hwnd, L"Maximum parallel connections to each mirror", 28, 153, 500, 24);
         context->maxPerMirrorEdit = CreateEdit(hwnd, ID_SETTINGS_MAX_PER_MIRROR, 590, 148, 110, 28, ES_NUMBER);
         SetWindowTextW(context->maxPerMirrorEdit, std::to_wstring(context->settings.maxConnectionsPerMirror).c_str());
         context->rampUpCheck = CreateCheckBox(hwnd,
             L"Gradually increase connections after successful range transfers",
             ID_SETTINGS_RAMP_UP, 28, 190, 660, 26, context->settings.rampUpConnections);
-        CreateLabel(hwnd, L"Wait before opening each additional connection (milliseconds)", 50, 224, 520, 24);
+        CreateSettingsLabel(hwnd, L"Wait before opening each additional connection (milliseconds)", 50, 224, 520, 24);
         context->rampDelayEdit = CreateEdit(hwnd, ID_SETTINGS_RAMP_DELAY, 590, 219, 110, 28, ES_NUMBER);
         SetWindowTextW(context->rampDelayEdit, std::to_wstring(context->settings.rampUpDelayMs).c_str());
 
-        CreateLabel(hwnd, L"RETRY BEHAVIOR", 26, 270, 300, 20);
+        CreateSettingsLabel(hwnd, L"RETRY BEHAVIOR", 26, 270, 300, 20);
         context->retryCheck = CreateCheckBox(hwnd, L"Keep retrying temporary mirror failures and server throttling",
             ID_SETTINGS_RETRY, 28, 298, 660, 26, context->settings.retryFailedMirrors);
         context->throttleAdaptCheck = CreateCheckBox(hwnd, L"Automatically reduce connections after HTTP 509 / 429",
             ID_SETTINGS_THROTTLE_ADAPT, 28, 329, 660, 26, context->settings.reduceConnectionsOnThrottle);
-        CreateLabel(hwnd, L"Delay before retrying a failed mirror (seconds)", 50, 365, 520, 24);
+        CreateSettingsLabel(hwnd, L"Delay before retrying a failed mirror (seconds)", 50, 365, 520, 24);
         context->retryDelayEdit = CreateEdit(hwnd, ID_SETTINGS_RETRY_DELAY, 590, 360, 110, 28, ES_NUMBER);
         SetWindowTextW(context->retryDelayEdit, std::to_wstring(context->settings.retryDelaySeconds).c_str());
-        CreateLabel(hwnd, L"Maximum retries per mirror (0 = unlimited)", 50, 401, 520, 24);
+        CreateSettingsLabel(hwnd, L"Maximum retries per mirror (0 = unlimited)", 50, 401, 520, 24);
         context->maxRetriesEdit = CreateEdit(hwnd, ID_SETTINGS_MAX_RETRIES, 590, 396, 110, 28, ES_NUMBER);
         SetWindowTextW(context->maxRetriesEdit, std::to_wstring(context->settings.maxRetriesPerMirror).c_str());
 
-        CreateLabel(hwnd, L"HTTP REQUEST IDENTITY", 26, 443, 300, 20);
+        CreateSettingsLabel(hwnd, L"CHUNK SCHEDULING", 26, 443, 300, 20);
+        CreateSettingsLabel(hwnd, L"Chunk size (MB; 0 = automatic)", 28, 472, 520, 24);
+        context->segmentSizeEdit = CreateEdit(hwnd, ID_SETTINGS_SEGMENT_SIZE, 590, 467, 110, 28, ES_NUMBER);
+        SetWindowTextW(context->segmentSizeEdit, std::to_wstring(context->settings.segmentSizeMB).c_str());
+
+        CreateSettingsLabel(hwnd, L"HTTP REQUEST IDENTITY", 26, 510, 300, 20);
         context->userAgentCheck = CreateCheckBox(hwnd, L"Send a custom User-Agent header",
-            ID_SETTINGS_USER_AGENT_ENABLE, 28, 470, 660, 26, context->settings.sendUserAgent);
-        context->userAgentEdit = CreateEdit(hwnd, ID_SETTINGS_USER_AGENT, 28, 502, 672, 30);
+            ID_SETTINGS_USER_AGENT_ENABLE, 28, 537, 660, 26, context->settings.sendUserAgent);
+        context->userAgentEdit = CreateEdit(hwnd, ID_SETTINGS_USER_AGENT, 28, 569, 672, 30);
         SetWindowTextW(context->userAgentEdit, context->settings.userAgent.c_str());
         EnableWindow(context->userAgentEdit, context->settings.sendUserAgent ? TRUE : FALSE);
 
@@ -1084,7 +1628,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         SendMessageW(context->tooltip, TTM_SETMAXTIPWIDTH, 0, 360);
         SendMessageW(context->tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 350);
         AddControlTooltip(context->tooltip, hwnd, context->maxTotalEdit,
-            L"Hard cap for active download requests across every file in the queue. Lower values reduce server and network load; higher values can improve throughput when mirrors allow it.");
+            L"Application safety limit: at most 64 active data requests across all downloads. This is not a Windows-wide limit; LinkForge uses it to prevent excessive worker and socket use. WinHTTP is separately configured for up to 64 connections per server, so values above 64 would not increase the per-server limit. Increase this only when downloading from many different servers and your system/network can handle the extra load.");
         AddControlTooltip(context->tooltip, hwnd, context->maxPerMirrorEdit,
             L"Maximum simultaneous byte-range requests sent to one mirror. The global connection limit still applies. For HTTP 509 or 429 responses, start low (1 or 2).");
         AddControlTooltip(context->tooltip, hwnd, context->rampUpCheck,
@@ -1099,21 +1643,25 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             L"Fallback delay after a retryable failure. If the server sends Retry-After, LinkForge honours its delay (up to 24 hours); otherwise this setting is used. A longer delay can help with bandwidth or request-rate limits.");
         AddControlTooltip(context->tooltip, hwnd, context->maxRetriesEdit,
             L"Number of retries after the first attempt for each mirror. 0 means unlimited retries until a mirror responds or you cancel the download.");
+        AddControlTooltip(context->tooltip, hwnd, context->segmentSizeEdit,
+            L"Chunk size controls the length of each HTTP byte-range task. 0 = Automatic: LinkForge calculates targetChunks = max(8, compatibleMirrorCount * 4), then chunkBytes = ceil(fileSize / targetChunks). The result is clamped to 64 KiB through 4 MiB; the final chunk may be shorter. Example: 2 compatible mirrors target 8 chunks; 5 mirrors target 20. A fixed value of 1-64 creates chunks of that many MiB. Smaller chunks give finer scheduling and retry granularity; larger chunks reduce request overhead but take longer to retry. The chosen size is saved with the download and does not change when resumed.");
         AddControlTooltip(context->tooltip, hwnd, context->userAgentCheck,
-            L"When enabled, send the User-Agent header with each HTTP request. Some servers distinguish clients by this header. This does not impersonate uGet automatically.");
+            L"When enabled, LinkForge sends the exact User-Agent value entered in the text field below with each HTTP request. Disable this option to omit the custom User-Agent header.");
         AddControlTooltip(context->tooltip, hwnd, context->userAgentEdit,
             L"Exact User-Agent header value to send. You can enter a value provided by the server or application you are authorized to use. Disable the checkbox to omit this custom header.");
 
-        CreateDarkButton(hwnd, L"Save settings", ID_SETTINGS_SAVE, 454, 565, 122, 36);
-        CreateDarkButton(hwnd, L"Cancel", ID_SETTINGS_CANCEL, 578, 565, 122, 36);
+        CreateDarkButton(hwnd, L"Save settings", ID_SETTINGS_SAVE, 454, 625, 122, 36);
+        CreateDarkButton(hwnd, L"Cancel", ID_SETTINGS_CANCEL, 578, 625, 122, 36);
         return 0;
     }
     case WM_COMMAND: {
         if (!context) break;
         const int id = LOWORD(wParam);
-        if (id == ID_SETTINGS_USER_AGENT_ENABLE && HIWORD(wParam) == BN_CLICKED) {
-            EnableWindow(context->userAgentEdit,
-                SendMessageW(context->userAgentCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        if (HIWORD(wParam) == BN_CLICKED && IsSettingsCheckBox(reinterpret_cast<HWND>(lParam))) {
+            HWND checkbox = reinterpret_cast<HWND>(lParam);
+            SetCheckBoxChecked(checkbox, !IsCheckBoxChecked(checkbox));
+            if (id == ID_SETTINGS_USER_AGENT_ENABLE)
+                EnableWindow(context->userAgentEdit, IsCheckBoxChecked(context->userAgentCheck) ? TRUE : FALSE);
             return 0;
         }
         if (id == ID_SETTINGS_CANCEL) {
@@ -1132,10 +1680,12 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             context->settings.retryDelaySeconds = value;
             if (!ReadUnsignedSetting(context->maxRetriesEdit, L"Maximum retries", 0, 100000, value)) return 0;
             context->settings.maxRetriesPerMirror = value;
-            context->settings.rampUpConnections = SendMessageW(context->rampUpCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            context->settings.reduceConnectionsOnThrottle = SendMessageW(context->throttleAdaptCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            context->settings.retryFailedMirrors = SendMessageW(context->retryCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            context->settings.sendUserAgent = SendMessageW(context->userAgentCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            if (!ReadUnsignedSetting(context->segmentSizeEdit, L"Chunk size (0 = automatic)", 0, 64, value)) return 0;
+            context->settings.segmentSizeMB = static_cast<int>(value);
+            context->settings.rampUpConnections = IsCheckBoxChecked(context->rampUpCheck);
+            context->settings.reduceConnectionsOnThrottle = IsCheckBoxChecked(context->throttleAdaptCheck);
+            context->settings.retryFailedMirrors = IsCheckBoxChecked(context->retryCheck);
+            context->settings.sendUserAgent = IsCheckBoxChecked(context->userAgentCheck);
             context->settings.userAgent = GetWindowTextString(context->userAgentEdit);
             context->settings.userAgent.erase(std::remove(context->settings.userAgent.begin(), context->settings.userAgent.end(), L'\r'), context->settings.userAgent.end());
             context->settings.userAgent.erase(std::remove(context->settings.userAgent.begin(), context->settings.userAgent.end(), L'\n'), context->settings.userAgent.end());
@@ -1163,8 +1713,9 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
     }
     case WM_CTLCOLORSTATIC: {
         HDC dc = reinterpret_cast<HDC>(wParam);
-        SetTextColor(dc, kText);
+        SetTextColor(dc, RGB(255, 255, 255));
         SetBkColor(dc, kWindowBg);
+        SetBkMode(dc, TRANSPARENT);
         return reinterpret_cast<LRESULT>(g_windowBrush);
     }
     case WM_CTLCOLOREDIT: {
@@ -1175,13 +1726,18 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
     }
     case WM_CTLCOLORBTN: {
         HDC dc = reinterpret_cast<HDC>(wParam);
-        SetTextColor(dc, kText);
+        SetTextColor(dc, RGB(255, 255, 255));
         SetBkColor(dc, kWindowBg);
+        SetBkMode(dc, TRANSPARENT);
         return reinterpret_cast<LRESULT>(g_windowBrush);
     }
-    case WM_DRAWITEM:
-        DrawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+    case WM_DRAWITEM: {
+        auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (draw && IsSettingsLabel(draw->hwndItem)) DrawSettingsLabel(draw);
+        else if (draw && IsSettingsCheckBox(draw->hwndItem)) DrawCheckBox(draw);
+        else DrawButton(draw);
         return TRUE;
+    }
     case WM_ERASEBKGND: {
         RECT rect{};
         GetClientRect(hwnd, &rect);
@@ -1204,7 +1760,7 @@ bool ShowSettingsDialog(HWND owner) {
     context.settings = linkforge::GetSettings();
     HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
         kSettingsClass, L"LinkForge Settings", WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 740, 665, owner, nullptr, g_instance, &context);
+        CW_USEDEFAULT, CW_USEDEFAULT, 740, 770, owner, nullptr, g_instance, &context);
     if (!dialog) return false;
     CenterOver(dialog, owner);
     EnableWindow(owner, FALSE);
@@ -1222,6 +1778,30 @@ bool ShowSettingsDialog(HWND owner) {
     return context.accepted;
 }
 
+bool g_shutdownStarted = false;
+
+void ShutdownDownloadJobs() {
+    if (g_shutdownStarted) return;
+    g_shutdownStarted = true;
+    if (g_mainWindow) KillTimer(g_mainWindow, kUiTimer);
+    g_shutdownResumeDownloads.clear();
+    for (const auto& download : g_downloads) {
+        bool userPaused = false;
+        bool terminal = false;
+        {
+            std::lock_guard lock(download->mutex);
+            userPaused = download->userPaused;
+            terminal = download->terminal;
+        }
+        if (!userPaused && !terminal) g_shutdownResumeDownloads.push_back(download.get());
+        // Graceful shutdown stops I/O and leaves a recoverable partial file. The
+        // periodic autosave remains the fallback for power loss without notification.
+        download->RequestCancel(true);
+    }
+    for (const auto& download : g_downloads) download->Join();
+    PersistDownloadsToFile(true);
+}
+
 LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
@@ -1232,13 +1812,14 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         HWND title = FindWindowExW(hwnd, nullptr, L"STATIC", L"LinkForge");
         if (title && g_fontTitle) SetFont(title, g_fontTitle);
 
-        CreateDarkButton(hwnd, L"＋ Add new file download", ID_ADD_DOWNLOAD, 20, 74, 200, 38);
-        CreateDarkButton(hwnd, L"File details / mirrors", ID_DETAILS, 230, 74, 175, 38);
-        CreateDarkButton(hwnd, L"Cancel download", ID_CANCEL, 415, 74, 142, 38);
-        CreateDarkButton(hwnd, L"Retry", ID_RETRY, 567, 74, 82, 38);
-        CreateDarkButton(hwnd, L"Remove entry", ID_REMOVE, 659, 74, 124, 38);
-        CreateDarkButton(hwnd, L"Open folder", ID_OPEN_FOLDER, 793, 74, 116, 38);
-        CreateDarkButton(hwnd, L"Settings", ID_SETTINGS, 920, 74, 105, 38);
+        CreateDarkButton(hwnd, L"＋ Add new file download", ID_ADD_DOWNLOAD, 20, 74, 190, 38);
+        CreateDarkButton(hwnd, L"File details / mirrors", ID_DETAILS, 220, 74, 155, 38);
+        g_pauseButton = CreateDarkButton(hwnd, L"Pause", ID_PAUSE, 385, 74, 92, 38);
+        CreateDarkButton(hwnd, L"Cancel", ID_CANCEL, 487, 74, 95, 38);
+        CreateDarkButton(hwnd, L"Retry", ID_RETRY, 592, 74, 72, 38);
+        CreateDarkButton(hwnd, L"Remove entry", ID_REMOVE, 674, 74, 112, 38);
+        CreateDarkButton(hwnd, L"Open folder", ID_OPEN_FOLDER, 796, 74, 108, 38);
+        CreateDarkButton(hwnd, L"Settings", ID_SETTINGS, 914, 74, 100, 38);
 
         g_mainList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                      WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -1249,8 +1830,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         AddColumn(g_mainList, 1, L"Progress", 230);
         AddColumn(g_mainList, 2, L"Downloaded / size", 175);
         AddColumn(g_mainList, 3, L"Speed", 105);
-        AddColumn(g_mainList, 4, L"ETA", 80);
-        AddColumn(g_mainList, 5, L"Status", 225);
+        AddColumn(g_mainList, 4, L"ETA (avg)", 95);
+        AddColumn(g_mainList, 5, L"Status", 210);
         g_statusText = CreateLabel(hwnd, L"Ready", 22, 608, 1050, 22);
         SetTimer(hwnd, kUiTimer, 500, nullptr);
         return 0;
@@ -1271,10 +1852,29 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         MoveWindow(g_statusText, 22, height - 32, width - 44, 22, TRUE);
         break;
     }
-    case WM_TIMER:
+    case WM_TIMER: {
         SampleSpeeds();
         UpdateMainList();
+        bool pauseCheckpointReady = false;
+        for (const auto& download : g_downloads) {
+            std::lock_guard lock(download->mutex);
+            if (download->pauseCheckpointPending && download->pauseSettled) {
+                pauseCheckpointReady = true;
+                break;
+            }
+        }
+        if (pauseCheckpointReady || GetTickCount64() - g_lastPersistTick >= 2000) {
+            if (PersistDownloadsToFile()) {
+                g_lastPersistTick = GetTickCount64();
+                for (const auto& download : g_downloads) {
+                    std::lock_guard lock(download->mutex);
+                    if (download->pauseCheckpointPending && download->pauseSettled)
+                        download->pauseCheckpointPending = false;
+                }
+            }
+        }
         return 0;
+    }
     case WM_COMMAND: {
         switch (LOWORD(wParam)) {
         case ID_ADD_DOWNLOAD:
@@ -1283,6 +1883,16 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         case ID_DETAILS:
             OpenDetails(hwnd, GetSelectedDownload());
             return 0;
+        case ID_PAUSE: {
+            auto download = GetSelectedDownload();
+            if (download) {
+                if (download->IsPaused()) download->Resume();
+                else download->Pause();
+                PersistDownloadsToFile();
+                UpdateMainList();
+            }
+            return 0;
+        }
         case ID_CANCEL: {
             auto download = GetSelectedDownload();
             if (download) {
@@ -1294,6 +1904,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
                     std::lock_guard lock(download->mutex);
                     download->statusText = choice == IDYES ? L"Cancelling; keeping partial data..." : L"Cancelling; deleting partial data...";
                 }
+                PersistDownloadsToFile();
             }
             return 0;
         }
@@ -1306,7 +1917,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
                     retryable = download->phase == DownloadPhase::Failed || download->phase == DownloadPhase::Cancelled ||
                                 download->phase == DownloadPhase::CancelledKept;
                 }
-                if (retryable) download->Retry();
+                if (retryable) {
+                    download->Retry();
+                    PersistDownloadsToFile();
+                }
             }
             return 0;
         }
@@ -1315,19 +1929,63 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (index < 0 || index >= static_cast<int>(g_downloads.size())) return 0;
             auto download = g_downloads[static_cast<size_t>(index)];
             bool terminal = false;
+            bool paused = false;
             {
                 std::lock_guard lock(download->mutex);
                 terminal = download->terminal;
+                paused = download->userPaused || download->pauseRequested.load() || download->phase == DownloadPhase::Paused;
             }
-            if (!terminal) {
-                MessageBoxW(hwnd, L"Cancel the download first. An active entry cannot be removed while it is writing to disk.",
+            if (!terminal && !paused) {
+                MessageBoxW(hwnd, L"Cancel or pause the download first. An active entry cannot be removed while it is writing to disk.",
                             L"Download is active", MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
-            // Join the completed worker before dropping the last queue-owned reference.
-            // This also makes removal safe if a details window isn't keeping the item alive.
+            const int confirm = MessageBoxW(hwnd,
+                L"Remove this entry and permanently delete its downloaded output and any partial/resume files?\n\nThis cannot be undone.",
+                L"Delete download and remove entry", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+            if (confirm != IDYES) return 0;
+            if (paused) download->RequestCancel(false);
             download->Join();
+            std::wstring finalPath, partPath, partialPath;
+            {
+                std::lock_guard lock(download->mutex);
+                finalPath = download->finalPath;
+                partPath = download->partPath;
+                partialPath = download->partialPath;
+            }
+            std::vector<std::wstring> pathsToDelete = {
+                finalPath, partPath, partialPath,
+                finalPath + L".linkforge.part", finalPath + L".partial"
+            };
+            std::sort(pathsToDelete.begin(), pathsToDelete.end());
+            pathsToDelete.erase(std::unique(pathsToDelete.begin(), pathsToDelete.end()), pathsToDelete.end());
+            for (const std::wstring& path : pathsToDelete) {
+                DWORD deleteError = ERROR_SUCCESS;
+                if (!DeleteFileIfPresent(path, deleteError)) {
+                    const std::wstring errorText = L"Could not delete this download file:\n" + path +
+                        L"\n\nWindows error: " + std::to_wstring(deleteError) +
+                        L"\nClose any program using the file, then try Remove entry again.";
+                    MessageBoxW(hwnd, errorText.c_str(), L"Could not remove download", MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+            }
+
+            std::vector<HWND> detailWindowsToClose;
+            for (HWND detailWindow : g_detailWindows) {
+                auto* detailContext = reinterpret_cast<DetailsContext*>(GetWindowLongPtrW(detailWindow, GWLP_USERDATA));
+                if (detailContext && detailContext->download == download) detailWindowsToClose.push_back(detailWindow);
+            }
             g_downloads.erase(g_downloads.begin() + index);
+            if (!PersistDownloadsToFile()) {
+                g_downloads.insert(g_downloads.begin() + std::min(index, static_cast<int>(g_downloads.size())), download);
+                g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
+                MessageBoxW(hwnd, L"The download files were deleted, but the queue INI could not be updated. The entry has been kept so you can retry removal.",
+                            L"Could not save download queue", MB_OK | MB_ICONERROR);
+                UpdateMainList();
+                return 0;
+            }
+            for (HWND detailWindow : detailWindowsToClose) DestroyWindow(detailWindow);
+            g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
             UpdateMainList();
             return 0;
         }
@@ -1372,10 +2030,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         FillRect(reinterpret_cast<HDC>(wParam), &rect, g_windowBrush);
         return 1;
     }
+    case WM_QUERYENDSESSION:
+        // Windows is asking whether this process permits logoff/restart/shutdown.
+        // Actual worker shutdown is performed in WM_ENDSESSION after confirmation.
+        return TRUE;
+    case WM_ENDSESSION:
+        if (wParam) {
+            ShutdownDownloadJobs();
+            DestroyWindow(hwnd);
+        }
+        return 0;
     case WM_CLOSE:
-        KillTimer(hwnd, kUiTimer);
-        for (const auto& download : g_downloads) download->RequestCancel(true);
-        for (const auto& download : g_downloads) download->Join();
+        ShutdownDownloadJobs();
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -1434,6 +2100,7 @@ bool RegisterClasses() {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     g_instance = instance;
     g_configPath = GetConfigFilePath();
+    g_downloadsStatePath = GetDownloadsStateFilePath();
     linkforge::DownloaderSettings startupSettings;
     LoadSettingsFromFile(startupSettings);
     linkforge::SetSettings(startupSettings);
@@ -1462,6 +2129,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         CoUninitialize();
         return 1;
     }
+    LoadDownloadsFromFile();
     if (!RegisterClasses()) {
         MessageBoxW(nullptr, L"Could not register the LinkForge window classes.", L"LinkForge", MB_OK | MB_ICONERROR);
         linkforge::ShutdownHttp();
@@ -1479,6 +2147,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
     ShowWindow(g_mainWindow, showCommand);
     UpdateWindow(g_mainWindow);
+    for (const auto& download : g_autoResumeDownloads) download->Start();
+    g_autoResumeDownloads.clear();
+    UpdateMainList();
+    g_lastPersistTick = GetTickCount64();
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -1486,8 +2158,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         DispatchMessageW(&message);
     }
 
-    for (const auto& download : g_downloads) download->RequestCancel(true);
-    for (const auto& download : g_downloads) download->Join();
+    ShutdownDownloadJobs();
     g_downloads.clear();
     linkforge::ShutdownHttp();
     if (g_font) DeleteObject(g_font);

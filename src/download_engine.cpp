@@ -7,8 +7,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cwchar>
+#include <ctime>
+#include <iomanip>
 #include <limits>
-#include <semaphore>
 #include <sstream>
 #include <utility>
 
@@ -17,26 +18,62 @@ namespace {
 
 constexpr DWORD kSampleBytes = 64 * 1024;
 constexpr uint64_t kSegmentBytes = 4ull * 1024ull * 1024ull;
-constexpr int kMaxWorkers = 8;
-constexpr int kMaxSegmentAttempts = 4;
 HINTERNET g_httpSession = nullptr;
-std::counting_semaphore<16> g_transferSlots(16);
+std::mutex g_settingsMutex;
+DownloaderSettings g_settings;
 
-class TransferSlotGuard {
+class TransferLimiter {
 public:
-    bool Acquire(const std::atomic<bool>& cancel) {
-        while (!cancel.load()) {
-            if (g_transferSlots.try_acquire_for(std::chrono::milliseconds(100))) { held = true; return true; }
+    bool Acquire(const std::atomic<bool>& cancel, const std::atomic<bool>* stop = nullptr) {
+        std::unique_lock lock(mutex);
+        while (!cancel.load() && (!stop || !stop->load())) {
+            if (active < limit) { ++active; return true; }
+            condition.wait_for(lock, std::chrono::milliseconds(100));
         }
         return false;
     }
-    ~TransferSlotGuard() { if (held) g_transferSlots.release(); }
+    void Release() {
+        std::lock_guard lock(mutex);
+        if (active > 0) --active;
+        condition.notify_all();
+    }
+    void SetLimit(int value) {
+        std::lock_guard lock(mutex);
+        limit = std::clamp(value, 1, 64);
+        condition.notify_all();
+    }
+private:
+    std::mutex mutex;
+    std::condition_variable condition;
+    int active = 0;
+    int limit = 8;
+};
+
+TransferLimiter g_transferLimiter;
+
+class TransferSlotGuard {
+public:
+    bool Acquire(const std::atomic<bool>& cancel, const std::atomic<bool>* stop = nullptr) {
+        held = g_transferLimiter.Acquire(cancel, stop);
+        return held;
+    }
+    ~TransferSlotGuard() { if (held) g_transferLimiter.Release(); }
     TransferSlotGuard() = default;
     TransferSlotGuard(const TransferSlotGuard&) = delete;
     TransferSlotGuard& operator=(const TransferSlotGuard&) = delete;
 private:
     bool held = false;
 };
+
+bool IsRetryableStatus(unsigned int status) {
+    return status == 0 || status == 408 || status == 425 || status == 429 ||
+           (status >= 500 && status <= 599);
+}
+
+bool CanRetry(const DownloaderSettings& settings, unsigned int retriesAlreadyMade) {
+    return settings.retryFailedMirrors &&
+           (settings.maxRetriesPerMirror == 0 || retriesAlreadyMade < settings.maxRetriesPerMirror);
+}
 
 struct ParsedUrl {
     std::wstring host;
@@ -65,12 +102,25 @@ struct ProbeResult {
     std::vector<unsigned char> prefix;
     std::vector<unsigned char> middle;
     std::vector<unsigned char> suffix;
+    unsigned int retryAfterSeconds = 0;
     std::wstring error;
 };
 
+uint64_t HashSample(const std::vector<unsigned char>& bytes) {
+    uint64_t hash = 1469598103934665603ull;
+    for (const unsigned char value : bytes) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 struct RangeResult {
     bool ok = false;
+    bool paused = false;
+    bool bytesFlushed = false;
     unsigned int httpStatus = 0;
+    unsigned int retryAfterSeconds = 0;
     bool protocolMismatch = false;
     bool removed = false;
     uint64_t received = 0;
@@ -148,8 +198,16 @@ std::unique_ptr<HttpHandles> StartRequest(const std::wstring& url,
         error = L"Could not create HTTP request: " + std::to_wstring(GetLastError());
         return {};
     }
-    if (!headers.empty() && !WinHttpAddRequestHeaders(handles->request, headers.c_str(),
-                                                       static_cast<DWORD>(headers.size()),
+    std::wstring requestHeaders = headers;
+    const DownloaderSettings settings = GetSettings();
+    if (settings.sendUserAgent && !settings.userAgent.empty()) {
+        std::wstring safeAgent = settings.userAgent;
+        safeAgent.erase(std::remove(safeAgent.begin(), safeAgent.end(), L'\r'), safeAgent.end());
+        safeAgent.erase(std::remove(safeAgent.begin(), safeAgent.end(), L'\n'), safeAgent.end());
+        if (!safeAgent.empty()) requestHeaders += L"User-Agent: " + safeAgent + L"\r\n";
+    }
+    if (!requestHeaders.empty() && !WinHttpAddRequestHeaders(handles->request, requestHeaders.c_str(),
+                                                       static_cast<DWORD>(requestHeaders.size()),
                                                        WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) {
         error = L"Could not set HTTP headers: " + std::to_wstring(GetLastError());
         return {};
@@ -184,6 +242,18 @@ std::wstring QueryHeader(HINTERNET request, DWORD query) {
     return std::wstring(buffer.data());
 }
 
+std::wstring QueryCustomHeader(HINTERNET request, const wchar_t* headerName) {
+    DWORD bytes = 0;
+    WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, headerName, nullptr, &bytes,
+                        WINHTTP_NO_HEADER_INDEX);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes < sizeof(wchar_t)) return L"";
+    std::vector<wchar_t> buffer(bytes / sizeof(wchar_t) + 1, L'\0');
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, headerName, buffer.data(), &bytes,
+                             WINHTTP_NO_HEADER_INDEX)) return L"";
+    return std::wstring(buffer.data());
+}
+
+
 bool ParseUnsigned(const std::wstring& s, uint64_t& result) {
     if (s.empty()) return false;
     wchar_t* end = nullptr;
@@ -191,6 +261,27 @@ bool ParseUnsigned(const std::wstring& s, uint64_t& result) {
     if (!end || *end != L'\0') return false;
     result = static_cast<uint64_t>(value);
     return true;
+}
+
+unsigned int GetRetryAfterSeconds(HINTERNET request) {
+    const std::wstring value = Trim(QueryCustomHeader(request, L"Retry-After"));
+    if (value.empty()) return 0;
+
+    uint64_t delay = 0;
+    if (ParseUnsigned(value, delay)) {
+        return static_cast<unsigned int>(std::clamp<uint64_t>(delay, 1, 86400));
+    }
+
+    // RFC 9110 also permits an HTTP-date. Parse the common IMF-fixdate form.
+    std::tm date{};
+    std::wistringstream stream(value);
+    stream >> std::get_time(&date, L"%a, %d %b %Y %H:%M:%S GMT");
+    if (stream.fail()) return 0;
+    const __time64_t target = _mkgmtime64(&date);
+    if (target < 0) return 0;
+    const __time64_t now = _time64(nullptr);
+    if (target <= now) return 1;
+    return static_cast<unsigned int>(std::clamp<__time64_t>(target - now, 1, 86400));
 }
 
 bool ParseContentRange(const std::wstring& value, uint64_t& start, uint64_t& end, uint64_t& total) {
@@ -238,6 +329,12 @@ ProbeResult ProbeUrl(const std::wstring& url) {
     // HEAD is only an optimization. Some servers reject it, so the range GET below
     // is the authoritative probe for size and byte-range support.
     auto head = StartRequest(url, L"HEAD", L"Accept-Encoding: identity\r\n", status, err);
+    if (head && IsRetryableStatus(status)) {
+        result.httpStatus = status;
+        result.retryAfterSeconds = GetRetryAfterSeconds(head->request);
+        result.error = L"HTTP " + std::to_wstring(status) + L" during mirror check";
+        return result;
+    }
     if (head && status >= 200 && status < 400) {
         uint64_t size = 0;
         if (ParseUnsigned(QueryHeader(head->request, WINHTTP_QUERY_CONTENT_LENGTH), size)) {
@@ -265,6 +362,7 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         return result;
     }
     result.httpStatus = rangeStatus;
+    result.retryAfterSeconds = GetRetryAfterSeconds(prefixResponse->request);
     if (rangeStatus != 200 && rangeStatus != 206) {
         result.error = L"HTTP " + std::to_wstring(rangeStatus);
         return result;
@@ -438,6 +536,20 @@ RangeResult DownloadRange(Download& download, const std::shared_ptr<Mirror>& mir
         result.error = L"Cancelled";
         return result;
     }
+    // Acquire the global network slot for the request itself, not for the worker
+    // thread lifetime. Idle workers (especially while a download is paused) must
+    // not reserve connection capacity that other queue entries can use.
+    TransferSlotGuard requestSlot;
+    if (!requestSlot.Acquire(download.cancelRequested, &download.pauseRequested)) {
+        result.paused = download.pauseRequested.load();
+        result.error = result.paused ? L"Paused" : L"Cancelled";
+        return result;
+    }
+    if (download.pauseRequested.load()) {
+        result.paused = true;
+        result.error = L"Paused";
+        return result;
+    }
     {
         std::lock_guard lock(download.mutex);
         if (!mirror->active) {
@@ -457,6 +569,7 @@ RangeResult DownloadRange(Download& download, const std::shared_ptr<Mirror>& mir
         return result;
     }
     result.httpStatus = status;
+    result.retryAfterSeconds = GetRetryAfterSeconds(response->request);
     if (status != 206) {
         result.protocolMismatch = (status == 200 || status == 416);
         result.error = L"Expected HTTP 206 for a byte range, received HTTP " + std::to_wstring(status);
@@ -486,6 +599,10 @@ RangeResult DownloadRange(Download& download, const std::shared_ptr<Mirror>& mir
     while (position <= end) {
         if (download.cancelRequested.load()) {
             result.error = L"Cancelled";
+            break;
+        }
+        if (download.pauseRequested.load()) {
+            result.paused = true;
             break;
         }
         {
@@ -521,20 +638,33 @@ RangeResult DownloadRange(Download& download, const std::shared_ptr<Mirror>& mir
         position += got;
         result.received += got;
     }
+    const bool rangeComplete = position == end + 1 && result.received == expectedLength;
+    // Any bytes reported as committed must be durable before the scheduler saves
+    // their offset. This also makes pause/retry preserve the in-flight part of a chunk.
+    if (result.received > 0 || rangeComplete) {
+        if (!FlushFileBuffers(output)) {
+            result.error = L"Could not flush received range data to disk: " + std::to_wstring(GetLastError());
+            result.bytesFlushed = false;
+        } else {
+            result.bytesFlushed = true;
+            result.ok = rangeComplete;
+        }
+    }
     CloseHandle(output);
 
-    if (position == end + 1 && result.received == expectedLength) result.ok = true;
-    else if (result.error.empty()) result.error = L"Incomplete range";
+    if (!result.ok && !result.paused && result.error.empty()) result.error = L"Incomplete range";
     return result;
 }
 
 struct FullResult {
     bool ok = false;
+    bool paused = false;
     unsigned int httpStatus = 0;
     bool removed = false;
     uint64_t bytes = 0;
     uint64_t responseSize = 0;
     bool responseSizeKnown = false;
+    unsigned int retryAfterSeconds = 0;
     std::wstring error;
 };
 
@@ -566,6 +696,7 @@ FullResult DownloadFull(Download& download, const std::shared_ptr<Mirror>& mirro
         return result;
     }
     result.httpStatus = status;
+    result.retryAfterSeconds = GetRetryAfterSeconds(response->request);
     if (status != 200) {
         result.error = L"Expected HTTP 200 for full download, received HTTP " + std::to_wstring(status);
         return result;
@@ -597,6 +728,27 @@ FullResult DownloadFull(Download& download, const std::shared_ptr<Mirror>& mirro
         if (download.cancelRequested.load()) {
             result.error = L"Cancelled";
             break;
+        }
+        if (download.pauseRequested.load()) {
+            // A pause is also a durability point for sequential fallback. This mode
+            // cannot generally resume from a byte offset after process restart, but
+            // flushing here at least preserves the partial bytes already received.
+            if (!FlushFileBuffers(output)) {
+                result.error = L"Could not flush paused partial download: " + std::to_wstring(GetLastError());
+                break;
+            }
+            {
+                std::lock_guard pauseStateLock(download.mutex);
+                download.pauseSettled = true;
+                download.phase = DownloadPhase::Paused;
+                download.statusText = L"Paused";
+                download.cv.notify_all();
+            }
+            std::unique_lock pauseLock(download.mutex);
+            download.cv.wait(pauseLock, [&] {
+                return download.cancelRequested.load() || !download.pauseRequested.load();
+            });
+            continue;
         }
         {
             std::lock_guard lock(download.mutex);
@@ -669,7 +821,8 @@ FullResult DownloadFull(Download& download, const std::shared_ptr<Mirror>& mirro
 }
 
 bool IsTerminal(DownloadPhase phase) {
-    return phase == DownloadPhase::Completed || phase == DownloadPhase::Failed || phase == DownloadPhase::Cancelled;
+    return phase == DownloadPhase::Completed || phase == DownloadPhase::Failed ||
+           phase == DownloadPhase::Cancelled || phase == DownloadPhase::CancelledKept;
 }
 
 std::wstring Lower(const std::wstring& text) {
@@ -711,21 +864,51 @@ std::wstring UniqueName(const std::wstring& folder, const std::wstring& desired)
 }
 
 void SetStatus(Download& d, DownloadPhase phase, const std::wstring& text) {
+    const bool terminal = IsTerminal(phase);
+    if (terminal) d.stopProbeRequests.store(true);
     std::lock_guard lock(d.mutex);
     d.phase = phase;
     d.statusText = text;
-    d.terminal = IsTerminal(phase);
+    d.terminal = terminal;
     d.cv.notify_all();
 }
 
 } // namespace
 
+DownloaderSettings GetSettings() {
+    std::lock_guard lock(g_settingsMutex);
+    return g_settings;
+}
+
+void SetSettings(const DownloaderSettings& settings) {
+    DownloaderSettings normalized = settings;
+    normalized.maxTotalConnections = std::clamp(normalized.maxTotalConnections, 1, 64);
+    normalized.maxConnectionsPerMirror = std::clamp(normalized.maxConnectionsPerMirror, 1, 32);
+    normalized.rampUpDelayMs = std::clamp(normalized.rampUpDelayMs, 0u, 60000u);
+    normalized.retryDelaySeconds = std::clamp(normalized.retryDelaySeconds, 1u, 3600u);
+    normalized.maxRetriesPerMirror = std::min(normalized.maxRetriesPerMirror, 100000u);
+    normalized.segmentSizeMB = std::clamp(normalized.segmentSizeMB, 0, 64);
+    if (normalized.userAgent.size() > 512) normalized.userAgent.resize(512);
+    normalized.userAgent.erase(std::remove(normalized.userAgent.begin(), normalized.userAgent.end(), L'\r'), normalized.userAgent.end());
+    normalized.userAgent.erase(std::remove(normalized.userAgent.begin(), normalized.userAgent.end(), L'\n'), normalized.userAgent.end());
+    {
+        std::lock_guard lock(g_settingsMutex);
+        g_settings = std::move(normalized);
+        g_transferLimiter.SetLimit(g_settings.maxTotalConnections);
+    }
+}
+
 bool InitializeHttp() {
     if (g_httpSession) return true;
-    g_httpSession = WinHttpOpen(L"LinkForge/1.0 (native Windows downloader)",
+    // Leave the session-level user agent empty; the optional per-request header below
+    // is the only User-Agent identity LinkForge sends.
+    g_httpSession = WinHttpOpen(L"",
                                 WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!g_httpSession) return false;
+    DWORD maxConnectionsPerServer = 64;
+    WinHttpSetOption(g_httpSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER,
+                     &maxConnectionsPerServer, sizeof(maxConnectionsPerServer));
     WinHttpSetTimeouts(g_httpSession, 7000, 7000, 15000, 15000);
     return true;
 }
@@ -742,10 +925,13 @@ std::wstring PhaseToString(DownloadPhase phase) {
     case DownloadPhase::Queued: return L"Queued";
     case DownloadPhase::Probing: return L"Checking mirrors";
     case DownloadPhase::DownloadingParallel: return L"Downloading (parallel)";
-    case DownloadPhase::DownloadingFallback: return L"Downloading (fallback)";
+    case DownloadPhase::DownloadingFallback: return L"Downloading (single mirror)";
+    case DownloadPhase::Pausing: return L"Pausing";
     case DownloadPhase::Completed: return L"Completed";
     case DownloadPhase::Failed: return L"Failed";
     case DownloadPhase::Cancelled: return L"Cancelled";
+    case DownloadPhase::CancelledKept: return L"Cancelled - partial kept";
+    case DownloadPhase::Paused: return L"Paused";
     }
     return L"Unknown";
 }
@@ -816,23 +1002,70 @@ std::vector<std::wstring> ParseUrlLines(const std::wstring& text) {
 }
 
 Download::Download(const std::wstring& folder, const std::wstring& name,
-                   const std::vector<std::wstring>& urls)
-    : outputFolder(folder), fileName(name) {
+                   const std::vector<std::wstring>& urls, const DownloadResumeState* resume,
+                   bool requestedSingleMirrorOnly)
+    : outputFolder(folder), fileName(name), singleMirrorOnly(requestedSingleMirrorOnly) {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(outputFolder), ec);
-    fileName = UniqueName(outputFolder, SanitizeOutputName(fileName.empty() ? L"download.bin" : fileName));
-    for (unsigned int attempt = 0; attempt < 1000; ++attempt) {
+    fileName = SanitizeOutputName(fileName.empty() ? L"download.bin" : fileName);
+    finalPath = (std::filesystem::path(outputFolder) / fileName).wstring();
+
+    if (resume) {
+        partPath = resume->partPath.empty() ? finalPath + L".linkforge.part" : resume->partPath;
+        sizeKnown = resume->sizeKnown;
+        totalSize = resume->totalSize;
+        persistentSegmentBytes = resume->segmentBytes;
+        restoredTotalSize = resume->totalSize;
+        restoredSegmentBytes = resume->segmentBytes;
+        restoredReferencePrefixHash = resume->referencePrefixHash;
+        restoredReferenceMiddleHash = resume->referenceMiddleHash;
+        restoredReferenceSuffixHash = resume->referenceSuffixHash;
+        restoredCompletedSegmentIndices = resume->completedSegmentIndices;
+        restoredPartialSegmentBytes = resume->partialSegmentBytes;
+        singleMirrorOnly = resume->singleMirrorOnly;
+        restorePending = resume->segmentBytes > 0 &&
+            (!resume->completedSegmentIndices.empty() || !resume->partialSegmentBytes.empty());
+        resumeFallbackPending = resume->resumeFallbackPending;
+        resumeFallbackMirrorUrl = resume->resumeFallbackMirrorUrl;
+        if (resume->wasCompleted) {
+            phase = DownloadPhase::Completed;
+            statusText = L"Completed (restored)";
+            terminal = true;
+            completedBytes = totalSize;
+        } else if (resume->wasFailed) {
+            phase = DownloadPhase::Failed;
+            statusText = L"Failed (restored)";
+            terminal = true;
+        } else if (resume->wasPaused) {
+            phase = DownloadPhase::Paused;
+            statusText = L"Paused";
+            userPaused = true;
+            pauseRequested.store(true);
+            terminal = false;
+        } else if (resume->wasCancelled) {
+            phase = DownloadPhase::Cancelled;
+            statusText = L"Cancelled (restored)";
+            terminal = true;
+        } else if (resume->wasCancelledKept) {
+            phase = DownloadPhase::CancelledKept;
+            statusText = L"Cancelled - partial kept (restored)";
+            terminal = true;
+            partialKept = true;
+            partialPath = partPath;
+        } else {
+            phase = DownloadPhase::Queued;
+            statusText = L"Queued to resume";
+            terminal = false;
+        }
+    } else {
+        fileName = UniqueName(outputFolder, fileName);
         finalPath = (std::filesystem::path(outputFolder) / fileName).wstring();
         partPath = finalPath + L".linkforge.part";
         HANDLE reservation = CreateFileW(partPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                          CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (reservation != INVALID_HANDLE_VALUE) {
-            CloseHandle(reservation);
-            break;
-        }
-        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) break;
-        fileName = UniqueName(outputFolder, fileName);
+        if (reservation != INVALID_HANDLE_VALUE) CloseHandle(reservation);
     }
+
     for (const auto& url : urls) {
         auto mirror = std::make_shared<Mirror>();
         mirror->id = nextMirrorId++;
@@ -852,17 +1085,104 @@ void Download::Start() {
     if (managerThread.joinable()) return;
     started = true;
     terminal = false;
+    userPaused = false;
+    pauseSettled = false;
+    pauseCheckpointPending = false;
+    pauseRequested.store(false);
     initialProbeComplete = false;
     phase = DownloadPhase::Probing;
     statusText = L"Checking mirrors";
     cancelRequested.store(false);
+    keepPartialOnCancel.store(false);
+    stopProbeRequests.store(false);
+    speedBps = 0.0;
+    etaSpeedBps = 0.0;
+    etaSpeedSamples.clear();
+    lastSpeedSampleBytes = networkBytes;
+    speedSampleTick = 0;
     auto self = shared_from_this();
     managerThread = std::thread([self]() { self->Run(); });
 }
 
-void Download::RequestCancel() {
+void Download::RequestCancel(bool keepPartial) {
+    keepPartialOnCancel.store(keepPartial);
     cancelRequested.store(true);
     cv.notify_all();
+}
+
+void Download::Pause() {
+    {
+        std::lock_guard lock(mutex);
+        if (terminal || phase == DownloadPhase::Completed || phase == DownloadPhase::Failed ||
+            phase == DownloadPhase::Cancelled || phase == DownloadPhase::CancelledKept) return;
+        userPaused = true;
+        pauseRequested.store(true);
+        pauseSettled = (activeRequests == 0);
+        pauseCheckpointPending = true;
+        phase = pauseSettled ? DownloadPhase::Paused : DownloadPhase::Pausing;
+        statusText = pauseSettled ? L"Paused" : L"Pausing - flushing active ranges";
+        speedBps = 0.0;
+        etaSpeedBps = 0.0;
+        etaSpeedSamples.clear();
+        speedSampleTick = 0;
+        lastSpeedSampleBytes = networkBytes;
+    }
+    cv.notify_all();
+}
+
+void Download::Resume() {
+    bool shouldStart = false;
+    bool shouldRetry = false;
+    std::vector<std::shared_ptr<Mirror>> pendingProbes;
+    {
+        std::lock_guard lock(mutex);
+        if (phase == DownloadPhase::Completed) return;
+        if (terminal && phase != DownloadPhase::CancelledKept && phase != DownloadPhase::Cancelled &&
+            phase != DownloadPhase::Failed) return;
+        // Do not clear pauseRequested while any range request is still unwinding.
+        // Otherwise a request can continue after the UI has presented Pause, and
+        // the pause checkpoint can race with writes that are still in progress.
+        if (pauseRequested.load() && !pauseSettled) return;
+
+        shouldStart = !started;
+        shouldRetry = terminal;
+        userPaused = false;
+        pauseSettled = false;
+        pauseCheckpointPending = false;
+        pauseRequested.store(false);
+        etaSpeedSamples.clear();
+        etaSpeedBps = 0.0;
+        speedBps = 0.0;
+        speedSampleTick = 0;
+        lastSpeedSampleBytes = networkBytes;
+        if (!shouldStart) {
+            phase = parallelMode ? DownloadPhase::DownloadingParallel : DownloadPhase::DownloadingFallback;
+            // This is the real transfer mode, not a sticky transitional label.
+            statusText = parallelMode ? L"Downloading with parallel byte ranges"
+                                      : L"Downloading from one mirror at a time";
+        }
+        if (started && !terminal && initialProbeComplete) {
+            for (const auto& mirror : mirrors)
+                if (mirror->active && mirror->probePending && !mirror->probeRunning && !mirror->probeDone)
+                    pendingProbes.push_back(mirror);
+        }
+    }
+    cv.notify_all();
+    if (shouldStart) {
+        if (shouldRetry) Retry();
+        else Start();
+    } else {
+        for (const auto& mirror : pendingProbes) SpawnProbeThread(mirror);
+    }
+}
+
+bool Download::IsPaused() const {
+    return pauseRequested.load();
+}
+
+bool Download::IsRunning() const {
+    std::lock_guard lock(mutex);
+    return started && !terminal;
 }
 
 void Download::JoinAuxiliaryThreads() {
@@ -885,26 +1205,77 @@ void Download::Retry() {
     Join();
     {
         std::lock_guard lock(mutex);
-        if (phase != DownloadPhase::Failed && phase != DownloadPhase::Cancelled) return;
+        if (phase != DownloadPhase::Failed && phase != DownloadPhase::Cancelled &&
+            phase != DownloadPhase::CancelledKept) return;
+
+        bool keepExisting = false;
+        std::error_code ec;
+        keepExisting = !partPath.empty() && std::filesystem::exists(std::filesystem::path(partPath), ec) && !ec;
+        // A restored job has not rebuilt its Segment array yet. Preserve the saved
+        // completed-range indices instead of clearing them when the user presses Retry.
+        std::vector<uint64_t> savedCompletedIndices = restoredCompletedSegmentIndices;
+        std::vector<std::pair<uint64_t, uint64_t>> savedPartialSegments = restoredPartialSegmentBytes;
+        restoredCompletedSegmentIndices.clear();
+        restoredPartialSegmentBytes.clear();
+        if (keepExisting && persistentSegmentBytes > 0 && totalSize > 0) {
+            if (!segments.empty()) {
+                for (size_t index = 0; index < segments.size(); ++index) {
+                    const Segment& segment = segments[index];
+                    if (segment.state == 2) restoredCompletedSegmentIndices.push_back(index);
+                    else if (segment.committedBytes > 0) restoredPartialSegmentBytes.emplace_back(index, segment.committedBytes);
+                }
+            } else {
+                restoredCompletedSegmentIndices = std::move(savedCompletedIndices);
+                restoredPartialSegmentBytes = std::move(savedPartialSegments);
+            }
+            restoredTotalSize = totalSize;
+            restoredSegmentBytes = persistentSegmentBytes;
+            restorePending = !restoredCompletedSegmentIndices.empty() || !restoredPartialSegmentBytes.empty();
+        } else {
+            restorePending = false;
+            restoredTotalSize = 0;
+            restoredSegmentBytes = 0;
+            restoredPartialSegmentBytes.clear();
+            persistentSegmentBytes = 0;
+            DeleteFileW(partPath.c_str());
+            partPath = finalPath + L".linkforge.part";
+            HANDLE reservation = CreateFileW(partPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (reservation != INVALID_HANDLE_VALUE) CloseHandle(reservation);
+        }
+
         cancelRequested.store(false);
+        pauseRequested.store(false);
+        userPaused = false;
+        pauseSettled = false;
+        pauseCheckpointPending = false;
+        keepPartialOnCancel.store(false);
+        stopProbeRequests.store(false);
+        partialKept = false;
+        partialPath.clear();
         terminal = false;
         started = false;
         initialProbeComplete = false;
         phase = DownloadPhase::Queued;
         statusText = L"Queued for retry";
         lastError.clear();
-        sizeKnown = false;
-        totalSize = completedBytes = fallbackBytes = networkBytes = 0;
-        firstTransferTick = 0;
-        endTransferTick = 0;
+        sizeKnown = keepExisting && restoredTotalSize > 0;
+        if (sizeKnown) totalSize = restoredTotalSize;
+        else totalSize = 0;
+        completedBytes = fallbackBytes = networkBytes = 0;
+        firstTransferTick = endTransferTick = 0;
         speedBps = 0;
-        lastSpeedSampleBytes = 0;
-        speedSampleTick = 0;
+        etaSpeedBps = 0.0;
+        etaSpeedSamples.clear();
+        lastSpeedSampleBytes = speedSampleTick = 0;
         completedSegments = 0;
         activeRequests = 0;
         engineFallbackNeeded = false;
         restartAsParallel = false;
+        parallelPoolPaused = false;
         parallelMode = false;
+        resumeFallbackPending = false;
+        resumeFallbackMirrorUrl.clear();
         referenceReady = false;
         referenceSizeKnown = false;
         referenceSize = 0;
@@ -913,23 +1284,6 @@ void Download::Retry() {
         rangeReferenceMiddle.clear();
         rangeReferenceSuffix.clear();
         segments.clear();
-        // A failed/cancelled attempt deletes its temporary file. Re-reserve a unique
-        // temporary name before retrying so multiple same-named downloads never share it.
-        bool reserved = false;
-        for (unsigned int attempt = 0; attempt < 1000 && !reserved; ++attempt) {
-            HANDLE reservation = CreateFileW(partPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                                             CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (reservation != INVALID_HANDLE_VALUE) {
-                CloseHandle(reservation);
-                reserved = true;
-                break;
-            }
-            if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) break;
-            fileName = UniqueName(outputFolder, fileName);
-            finalPath = (std::filesystem::path(outputFolder) / fileName).wstring();
-            partPath = finalPath + L".linkforge.part";
-        }
-        if (!reserved) lastError = L"Could not reserve a temporary filename for retry";
         for (auto& mirror : mirrors) {
             mirror->probePending = mirror->active;
             mirror->probeDone = false;
@@ -941,7 +1295,17 @@ void Download::Retry() {
             mirror->rangeFailed = false;
             mirror->fallbackTried = false;
             mirror->activeRequests = 0;
+            mirror->completedChunks = 0;
+            mirror->failedChunks = 0;
             mirror->failures = 0;
+            mirror->probeAttempts = 0;
+            mirror->fallbackAttempts = 0;
+            mirror->successfulConnections = 0;
+            mirror->throttleConnectionLimit = 0;
+            mirror->successesSinceThrottle = 0;
+            mirror->nextConnectionTick = 0;
+            mirror->throttleUntilTick = 0;
+            mirror->probeRunning = false;
             mirror->lastHttpStatus = 0;
             mirror->networkBytes = 0;
             mirror->firstTransferTick = 0;
@@ -963,23 +1327,31 @@ void Download::Retry() {
 void Download::AddMirrors(const std::vector<std::wstring>& urls) {
     std::vector<std::shared_ptr<Mirror>> added;
     bool shouldProbe = false;
+    bool shouldStart = false;
     {
         std::lock_guard lock(mutex);
         if (phase == DownloadPhase::Completed) return;
+        const bool canQueueNewMirrors = !terminal && phase != DownloadPhase::Failed &&
+                                        phase != DownloadPhase::Cancelled && phase != DownloadPhase::CancelledKept;
         for (const auto& url : urls) {
             const auto exists = std::find_if(mirrors.begin(), mirrors.end(), [&](const auto& m) { return m->url == url && m->active; });
             if (exists != mirrors.end()) continue;
             auto mirror = std::make_shared<Mirror>();
             mirror->id = nextMirrorId++;
             mirror->url = url;
-            mirror->state = started && !terminal ? L"Checking..." : L"Waiting for retry";
-            mirror->probePending = started && !terminal;
+            mirror->state = (started && !terminal) || canQueueNewMirrors ? L"Checking..." : L"Waiting for retry";
+            mirror->probePending = canQueueNewMirrors;
             mirrors.push_back(mirror);
             added.push_back(mirror);
         }
-        shouldProbe = started && !terminal && initialProbeComplete && !cancelRequested.load();
+        shouldStart = !started && !terminal && !userPaused && phase != DownloadPhase::Paused && !added.empty();
+        shouldProbe = started && !terminal && initialProbeComplete && !cancelRequested.load() && !pauseRequested.load();
     }
-    if (shouldProbe) {
+    if (shouldStart) {
+        // This also supports a restored queue item whose mirrors were all removed
+        // before shutdown. Adding the first replacement mirror starts its probing.
+        Start();
+    } else if (shouldProbe) {
         for (const auto& mirror : added) SpawnProbeThread(mirror);
     }
     cv.notify_all();
@@ -1000,18 +1372,72 @@ bool Download::RemoveMirror(int mirrorId) {
 }
 
 void Download::SpawnProbeThread(const std::shared_ptr<Mirror>& mirror) {
+    {
+        std::lock_guard lock(mutex);
+        if (stopProbeRequests.load() || !mirror->active || mirror->probeRunning || mirror->probeDone) return;
+        mirror->probeRunning = true;
+    }
     auto self = shared_from_this();
     std::lock_guard lock(auxiliaryMutex);
-    auxiliaryThreads.emplace_back([self, mirror]() { self->ProbeOne(mirror, true); });
+    auxiliaryThreads.emplace_back([self, mirror]() { self->ProbeOne(mirror); });
 }
 
-void Download::ProbeOne(const std::shared_ptr<Mirror>& mirror, bool dynamicProbe) {
-    if (cancelRequested.load()) return;
-    ProbeResult result = ProbeUrl(mirror->url);
+void Download::ProbeOne(const std::shared_ptr<Mirror>& mirror) {
+    ProbeResult result;
+    unsigned int retriesMade = 0;
+    while (!cancelRequested.load() && !stopProbeRequests.load()) {
+        if (pauseRequested.load()) {
+            std::unique_lock pauseLock(mutex);
+            cv.wait_for(pauseLock, std::chrono::milliseconds(200), [&] {
+                return cancelRequested.load() || stopProbeRequests.load() || !pauseRequested.load();
+            });
+            continue;
+        }
+        {
+            std::lock_guard lock(mutex);
+            if (!mirror->active) {
+                mirror->probePending = false;
+                mirror->probeRunning = false;
+                mirror->probeDone = true;
+                mirror->state = L"Removed";
+                cv.notify_all();
+                return;
+            }
+            mirror->state = retriesMade == 0 ? L"Checking mirror" : L"Retrying mirror check";
+        }
+        {
+            TransferSlotGuard probeSlot;
+            if (!probeSlot.Acquire(cancelRequested, &stopProbeRequests)) break;
+            if (stopProbeRequests.load()) break;
+            result = ProbeUrl(mirror->url);
+        }
+        if (stopProbeRequests.load() || result.ok || !IsRetryableStatus(result.httpStatus)) break;
+        const DownloaderSettings settings = GetSettings();
+        if (!CanRetry(settings, retriesMade)) break;
+        ++retriesMade;
+        {
+            std::lock_guard lock(mutex);
+            mirror->probeAttempts = static_cast<int>(retriesMade + 1);
+            mirror->lastHttpStatus = result.httpStatus;
+            mirror->lastError = result.error;
+            mirror->state = L"Connection failed; retry scheduled";
+        }
+        const unsigned int retryDelay = result.retryAfterSeconds > 0
+            ? result.retryAfterSeconds : settings.retryDelaySeconds;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(retryDelay);
+        while (!cancelRequested.load() && !stopProbeRequests.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::unique_lock lock(mutex);
+            if (!mirror->active) break;
+            cv.wait_for(lock, std::chrono::milliseconds(100));
+        }
+    }
     {
         std::lock_guard lock(mutex);
         mirror->probePending = false;
+        mirror->probeRunning = false;
         mirror->probeDone = true;
+        mirror->probeAttempts = static_cast<int>(retriesMade + 1);
         mirror->probeOk = result.ok;
         mirror->lastHttpStatus = result.httpStatus;
         mirror->sizeKnown = result.sizeKnown;
@@ -1024,14 +1450,14 @@ void Download::ProbeOne(const std::shared_ptr<Mirror>& mirror, bool dynamicProbe
         mirror->suffixSample = std::move(result.suffix);
         mirror->lastError = result.error;
         if (!mirror->active) mirror->state = L"Removed";
+        else if (stopProbeRequests.load()) mirror->state = L"Probe stopped";
         else if (!mirror->probeOk) mirror->state = L"Probe failed";
         else mirror->state = mirror->rangeCapable ? L"Checking compatibility" : L"No range support";
         ReevaluateMirrorsLocked();
-        if (dynamicProbe && (phase == DownloadPhase::DownloadingFallback ||
-                             (phase == DownloadPhase::Probing && initialProbeComplete)) &&
-            mirror->active && mirror->compatible && mirror->rangeCapable && !mirror->rangeFailed) {
-            // Upgrade a sequential transfer if a newly added compatible mirror makes
-            // parallel ranges possible. The current full request is stopped at the next read.
+        const bool shouldUpgrade = !singleMirrorOnly && (phase == DownloadPhase::DownloadingFallback ||
+                                   (phase == DownloadPhase::Probing && initialProbeComplete));
+        if (shouldUpgrade && mirror->active && mirror->compatible &&
+            mirror->rangeCapable && !mirror->rangeFailed) {
             restartAsParallel = true;
         }
         cv.notify_all();
@@ -1116,6 +1542,11 @@ void Download::ReevaluateMirrorsLocked() {
         }
     }
 
+    if (rangeReferenceReady) {
+        referencePrefixHash = HashSample(referencePrefix);
+        referenceMiddleHash = HashSample(rangeReferenceMiddle);
+        referenceSuffixHash = HashSample(rangeReferenceSuffix);
+    }
     if (rangeReferenceReady && referenceSizeKnown && (!sizeKnown || phase == DownloadPhase::Probing)) {
         totalSize = referenceSize;
         sizeKnown = true;
@@ -1123,85 +1554,126 @@ void Download::ReevaluateMirrorsLocked() {
 }
 
 void Download::ProbeInitialMirrors() {
-    // The manager thread owns initial probing. URLs added while this phase is active
-    // are picked up on the next pass, avoiding duplicate probes on the same mirror.
-    while (!cancelRequested.load()) {
+    while (!cancelRequested.load() && !stopProbeRequests.load()) {
         std::vector<std::shared_ptr<Mirror>> pending;
         {
             std::lock_guard lock(mutex);
             for (const auto& mirror : mirrors) {
-                if (mirror->active && mirror->probePending && !mirror->probeDone) pending.push_back(mirror);
-                else if (!mirror->active && mirror->probePending) {
-                    mirror->probePending = false;
-                    mirror->probeDone = true;
-                    mirror->state = L"Removed";
+                if (!mirror->active) {
+                    if (mirror->probePending) {
+                        mirror->probePending = false;
+                        mirror->probeDone = true;
+                        mirror->state = L"Removed";
+                    }
+                    continue;
                 }
-            }
-            if (pending.empty()) {
-                initialProbeComplete = true;
-                cv.notify_all();
-                break;
+                if (mirror->probePending && !mirror->probeDone && !mirror->probeRunning) {
+                    mirror->probeRunning = true;
+                    pending.push_back(mirror);
+                }
             }
         }
 
+        // Launch every initial mirror probe independently. A failed/slow mirror must
+        // not prevent the manager from using the first mirror that becomes usable.
         for (const auto& mirror : pending) {
-            if (cancelRequested.load()) return;
-            ProbeResult result = ProbeUrl(mirror->url);
-            {
-                std::lock_guard lock(mutex);
-                mirror->probePending = false;
-                mirror->probeDone = true;
-                mirror->probeOk = result.ok;
-                mirror->lastHttpStatus = result.httpStatus;
-                mirror->sizeKnown = result.sizeKnown;
-                mirror->size = result.size;
-                mirror->rangeCapable = result.rangeCapable;
-                mirror->etag = result.etag;
-                mirror->lastModified = result.lastModified;
-                mirror->prefixSample = std::move(result.prefix);
-                mirror->middleSample = std::move(result.middle);
-                mirror->suffixSample = std::move(result.suffix);
-                mirror->lastError = result.error;
-                mirror->state = mirror->probeOk ? L"Checking compatibility" : L"Probe failed";
-                ReevaluateMirrorsLocked();
+            auto self = shared_from_this();
+            std::lock_guard lock(auxiliaryMutex);
+            auxiliaryThreads.emplace_back([self, mirror]() { self->ProbeOne(mirror); });
+        }
+
+        bool canStartDownload = false;
+        {
+            // Re-check under the lock so an URL added just as the initial scan ends
+            // cannot be stranded in the pending list without a probe thread.
+            std::lock_guard lock(mutex);
+            const bool hasUsableMirror = std::any_of(mirrors.begin(), mirrors.end(), [](const auto& mirror) {
+                return mirror->active && mirror->probeDone && mirror->probeOk && mirror->compatible;
+            });
+            const bool hasPendingOrRunningProbe = std::any_of(mirrors.begin(), mirrors.end(), [](const auto& mirror) {
+                return mirror->active && (mirror->probePending || mirror->probeRunning);
+            });
+            canStartDownload = hasUsableMirror || !hasPendingOrRunningProbe;
+            if (canStartDownload) {
+                initialProbeComplete = true;
                 cv.notify_all();
             }
         }
+        if (canStartDownload) break;
+
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::milliseconds(100));
     }
 }
 
 bool Download::PrepareParallelFile(std::wstring& error) {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(outputFolder), ec);
-    HANDLE file = CreateFileW(partPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
-    if (file == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND) {
-        file = CreateFileW(partPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
-    }
-    if (file == INVALID_HANDLE_VALUE && (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS)) {
-        for (unsigned int attempt = 0; attempt < 1000 && file == INVALID_HANDLE_VALUE; ++attempt) {
-            std::lock_guard lock(mutex);
-            fileName = UniqueName(outputFolder, fileName);
-            finalPath = (std::filesystem::path(outputFolder) / fileName).wstring();
-            partPath = finalPath + L".linkforge.part";
-            file = CreateFileW(partPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
-                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
-        }
-    }
-    if (file == INVALID_HANDLE_VALUE) {
-        error = L"Could not create partial file: " + std::to_wstring(GetLastError());
-        return false;
-    }
-    LARGE_INTEGER size{};
+
+    bool fileExisted = std::filesystem::exists(std::filesystem::path(partPath), ec) && !ec;
+
+    // A pause stops and joins the current worker pool. When the manager wakes after
+    // Resume, it calls RunParallel again. Keep the in-memory chunk table and offsets
+    // in that case; rebuilding it here would erase the progress from the current run.
     {
         std::lock_guard lock(mutex);
-        size.QuadPart = static_cast<LONGLONG>(totalSize);
+        if (!segments.empty() && persistentSegmentBytes > 0) {
+            if (!fileExisted) {
+                error = L"The partial download file is missing; refusing to reset completed chunks";
+                return false;
+            }
+            HANDLE existing = CreateFileW(partPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (existing == INVALID_HANDLE_VALUE) {
+                error = L"Could not reopen the existing partial file: " + std::to_wstring(GetLastError());
+                return false;
+            }
+            LARGE_INTEGER existingLength{};
+            const bool lengthKnown = GetFileSizeEx(existing, &existingLength) != FALSE;
+            CloseHandle(existing);
+            if (!lengthKnown || existingLength.QuadPart != static_cast<LONGLONG>(totalSize)) {
+                error = L"The existing partial file size changed; refusing to rebuild and discard chunk progress";
+                return false;
+            }
+            return true;
+        }
     }
-    if (!SetFilePointerEx(file, size, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) {
+
+    bool useRestore = false;
+    uint64_t sizeToPrepare = 0;
+    uint64_t chosenSegmentBytes = 0;
+    std::vector<uint64_t> completedIndices;
+    {
+        std::lock_guard lock(mutex);
+        sizeToPrepare = totalSize;
+        useRestore = restorePending && restoredTotalSize == totalSize && fileExisted && restoredSegmentBytes > 0 &&
+            (!restoredCompletedSegmentIndices.empty() || !restoredPartialSegmentBytes.empty());
+        if (useRestore) {
+            chosenSegmentBytes = restoredSegmentBytes;
+            completedIndices = restoredCompletedSegmentIndices;
+        }
+    }
+
+    HANDLE file = CreateFileW(partPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              fileExisted ? OPEN_EXISTING : CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = L"Could not open partial file: " + std::to_wstring(GetLastError());
+        return false;
+    }
+
+    LARGE_INTEGER existingSize{};
+    const bool existingSizeKnown = GetFileSizeEx(file, &existingSize) != FALSE;
+    if (useRestore && (!existingSizeKnown || existingSize.QuadPart != static_cast<LONGLONG>(sizeToPrepare))) {
+        useRestore = false;
+        completedIndices.clear();
+    }
+    LARGE_INTEGER size{};
+    size.QuadPart = static_cast<LONGLONG>(sizeToPrepare);
+    if (!SetFilePointerEx(file, size, nullptr, FILE_BEGIN) || !SetEndOfFile(file) || !FlushFileBuffers(file)) {
         error = L"Could not prepare output file: " + std::to_wstring(GetLastError());
         CloseHandle(file);
-        DeleteFileW(partPath.c_str());
         return false;
     }
     CloseHandle(file);
@@ -1214,15 +1686,45 @@ bool Download::PrepareParallelFile(std::wstring& error) {
     for (const auto& mirror : mirrors) {
         if (mirror->active && mirror->compatible && mirror->rangeCapable && !mirror->rangeFailed) ++compatibleMirrors;
     }
-    const uint64_t targetSegments = std::max<uint64_t>(8, static_cast<uint64_t>(std::max<size_t>(1, compatibleMirrors)) * 4);
-    const uint64_t adaptiveChunk = (totalSize + targetSegments - 1) / targetSegments;
-    const uint64_t segmentBytes = std::min<uint64_t>(kSegmentBytes, std::max<uint64_t>(64 * 1024, adaptiveChunk));
-    for (uint64_t start = 0; start < totalSize; start += segmentBytes) {
+    if (chosenSegmentBytes == 0) {
+        const DownloaderSettings settings = GetSettings();
+        if (settings.segmentSizeMB > 0) {
+            chosenSegmentBytes = static_cast<uint64_t>(settings.segmentSizeMB) * 1024ull * 1024ull;
+        } else {
+            // Automatic: aim for at least 8 chunks (or roughly 4 per compatible
+            // mirror), then clamp each chunk to 64 KiB .. 4 MiB.
+            const uint64_t targetSegments = std::max<uint64_t>(8, static_cast<uint64_t>(std::max<size_t>(1, compatibleMirrors)) * 4);
+            const uint64_t adaptiveChunk = (totalSize + targetSegments - 1) / targetSegments;
+            chosenSegmentBytes = std::min<uint64_t>(kSegmentBytes, std::max<uint64_t>(64 * 1024, adaptiveChunk));
+        }
+    }
+    persistentSegmentBytes = chosenSegmentBytes;
+    for (uint64_t start = 0; start < totalSize; start += chosenSegmentBytes) {
         Segment segment;
         segment.start = start;
-        segment.end = std::min<uint64_t>(totalSize - 1, start + segmentBytes - 1);
+        segment.end = std::min<uint64_t>(totalSize - 1, start + chosenSegmentBytes - 1);
         segments.push_back(segment);
     }
+    if (useRestore) {
+        for (const uint64_t index : completedIndices) {
+            if (index >= segments.size()) continue;
+            Segment& segment = segments[static_cast<size_t>(index)];
+            segment.state = 2;
+            completedBytes += segment.end - segment.start + 1;
+            ++completedSegments;
+        }
+        for (const auto& [index, bytes] : restoredPartialSegmentBytes) {
+            if (index >= segments.size()) continue;
+            Segment& segment = segments[static_cast<size_t>(index)];
+            if (segment.state == 2) continue;
+            const uint64_t segmentLength = segment.end - segment.start + 1;
+            if (bytes < segmentLength) segment.committedBytes = bytes;
+        }
+    }
+    restorePending = false;
+    restoredCompletedSegmentIndices.clear();
+    restoredPartialSegmentBytes.clear();
+    restoredSegmentBytes = 0;
     if (totalSize == 0) {
         error = L"The file is empty; use sequential mode";
         return false;
@@ -1237,8 +1739,9 @@ void Download::RunParallel() {
         parallelMode = true;
         engineFallbackNeeded = false;
         restartAsParallel = false;
-        phase = DownloadPhase::DownloadingParallel;
-        statusText = L"Downloading with parallel byte ranges";
+        parallelPoolPaused = false;
+        phase = pauseRequested.load() ? DownloadPhase::Paused : DownloadPhase::DownloadingParallel;
+        statusText = pauseRequested.load() ? L"Paused" : L"Downloading with parallel byte ranges";
         terminal = false;
     }
     if (!PrepareParallelFile(error)) {
@@ -1253,14 +1756,14 @@ void Download::RunParallel() {
         std::lock_guard lock(mutex);
         segmentCount = segments.size();
     }
-    const int workerCount = static_cast<int>(std::min<size_t>(kMaxWorkers, std::max<size_t>(1, segmentCount)));
+    const DownloaderSettings workerSettings = GetSettings();
+    const int workerCount = static_cast<int>(std::min<size_t>(
+        static_cast<size_t>(workerSettings.maxTotalConnections), std::max<size_t>(1, segmentCount)));
     std::vector<std::thread> workers;
     workers.reserve(static_cast<size_t>(workerCount));
     auto self = shared_from_this();
     for (int i = 0; i < workerCount; ++i) workers.emplace_back([self]() {
         Download& d = *self;
-        TransferSlotGuard slot;
-        if (!slot.Acquire(d.cancelRequested)) return;
         while (!d.cancelRequested.load()) {
             int segmentIndex = -1;
             uint64_t expectedTotal = 0;
@@ -1275,19 +1778,50 @@ void Download::RunParallel() {
                 };
                 auto chooseMirror = [&]() -> std::shared_ptr<Mirror> {
                     std::shared_ptr<Mirror> best;
+                    const DownloaderSettings settings = GetSettings();
+                    const uint64_t now = GetTickCount64();
                     for (const auto& mirror : d.mirrors) {
                         if (!mirror->active || !mirror->probeDone || !mirror->probeOk || !mirror->compatible ||
                             !mirror->rangeCapable || mirror->rangeFailed || !d.rangeReferenceReady ||
                             !mirror->sizeKnown || mirror->size != d.totalSize ||
                             mirror->middleSample != d.rangeReferenceMiddle ||
-                            mirror->suffixSample != d.rangeReferenceSuffix) continue;
-                        if (!best || mirror->activeRequests < best->activeRequests) best = mirror;
+                            mirror->suffixSample != d.rangeReferenceSuffix ||
+                            mirror->throttleUntilTick > now) continue;
+                        const int configuredLimit = settings.reduceConnectionsOnThrottle &&
+                            mirror->throttleConnectionLimit > 0
+                            ? std::min(settings.maxConnectionsPerMirror, mirror->throttleConnectionLimit)
+                            : settings.maxConnectionsPerMirror;
+                        const int allowed = settings.rampUpConnections
+                            ? std::min(configuredLimit, 1 + mirror->successfulConnections)
+                            : configuredLimit;
+                        if (mirror->activeRequests >= allowed) continue;
+                        if (settings.rampUpConnections &&
+                            mirror->successfulConnections > mirror->activeRequests &&
+                            mirror->nextConnectionTick > now) continue;
+                        if (!best || mirror->activeRequests < best->activeRequests ||
+                            (mirror->activeRequests == best->activeRequests && mirror->speedBps > best->speedBps)) {
+                            best = mirror;
+                        }
                     }
                     return best;
                 };
                 while (!d.cancelRequested.load()) {
                     if (d.engineFallbackNeeded || d.restartAsParallel) return;
                     if (d.completedSegments == static_cast<int>(d.segments.size())) return;
+                    if (d.pauseRequested.load()) {
+                        // Exit this worker instead of sleeping inside the old pool.
+                        // The manager joins every worker, checkpoints all flushed
+                        // offsets, and creates a fresh pool after Resume. Record the
+                        // reason because Resume can arrive before the manager joins us.
+                        d.parallelPoolPaused = true;
+                        if (d.activeRequests == 0) {
+                            d.pauseSettled = true;
+                            d.phase = DownloadPhase::Paused;
+                            d.statusText = L"Paused";
+                            d.cv.notify_all();
+                        }
+                        return;
+                    }
                     segmentIndex = findPending();
                     if (segmentIndex < 0) {
                         d.cv.wait_for(lock, std::chrono::milliseconds(250));
@@ -1295,14 +1829,30 @@ void Download::RunParallel() {
                     }
                     chosenMirror = chooseMirror();
                     if (chosenMirror) break;
-                    const bool pendingProbe = std::any_of(d.mirrors.begin(), d.mirrors.end(), [](const auto& m) { return m->probePending; });
-                    if (d.activeRequests == 0 && !pendingProbe) {
+                    const bool pendingProbe = std::any_of(d.mirrors.begin(), d.mirrors.end(), [](const auto& m) { return m->probePending || m->probeRunning; });
+                    const uint64_t now = GetTickCount64();
+                    const DownloaderSettings schedulerSettings = GetSettings();
+                    const bool waitingOnThrottleOrRamp = std::any_of(d.mirrors.begin(), d.mirrors.end(), [&](const auto& m) {
+                        if (!m->active || !m->compatible || !m->rangeCapable || m->rangeFailed) return false;
+                        // An active request may still finish; a future throttle/ramp
+                        // deadline is also a reason to wait even when activeRequests == 0.
+                        if (m->activeRequests > 0 || m->throttleUntilTick > now) return true;
+                        const int configuredLimit = schedulerSettings.reduceConnectionsOnThrottle && m->throttleConnectionLimit > 0
+                            ? std::min(schedulerSettings.maxConnectionsPerMirror, m->throttleConnectionLimit)
+                            : schedulerSettings.maxConnectionsPerMirror;
+                        const int allowed = schedulerSettings.rampUpConnections
+                            ? std::min(configuredLimit, 1 + m->successfulConnections)
+                            : configuredLimit;
+                        return m->activeRequests < allowed && m->successfulConnections > 0 &&
+                               m->nextConnectionTick > now;
+                    });
+                    if (d.activeRequests == 0 && !pendingProbe && !waitingOnThrottleOrRamp) {
                         d.engineFallbackNeeded = true;
-                        d.statusText = L"Parallel sources unavailable; switching to fallback";
+                        d.statusText = L"No usable parallel range source; waiting for retry or mirror changes";
                         d.cv.notify_all();
                         return;
                     }
-                    d.cv.wait_for(lock, std::chrono::milliseconds(250));
+                    d.cv.wait_for(lock, std::chrono::milliseconds(200));
                 }
                 if (d.cancelRequested.load()) return;
                 expectedTotal = d.totalSize;
@@ -1316,7 +1866,8 @@ void Download::RunParallel() {
                 chosenMirror->state = L"Transferring range";
             }
 
-            const uint64_t start = d.segments[static_cast<size_t>(segmentIndex)].start;
+            const uint64_t start = d.segments[static_cast<size_t>(segmentIndex)].start +
+                                   d.segments[static_cast<size_t>(segmentIndex)].committedBytes;
             const uint64_t end = d.segments[static_cast<size_t>(segmentIndex)].end;
             RangeResult transfer = DownloadRange(d, chosenMirror, segmentIndex, start, end, expectedTotal);
             {
@@ -1329,28 +1880,74 @@ void Download::RunParallel() {
                 if (transfer.httpStatus != 0) chosenMirror->lastHttpStatus = transfer.httpStatus;
                 if (transfer.ok) {
                     segment.state = 2;
+                    segment.committedBytes = 0;
                     d.completedBytes += (segment.end - segment.start + 1);
                     ++d.completedSegments;
+                    ++chosenMirror->completedChunks;
                     chosenMirror->failures = 0;
+                    ++chosenMirror->successfulConnections;
+                    const DownloaderSettings settings = GetSettings();
+                    if (chosenMirror->throttleConnectionLimit > 0 &&
+                        chosenMirror->throttleConnectionLimit < settings.maxConnectionsPerMirror) {
+                        ++chosenMirror->successesSinceThrottle;
+                        if (chosenMirror->successesSinceThrottle >= 3) {
+                            ++chosenMirror->throttleConnectionLimit;
+                            chosenMirror->successesSinceThrottle = 0;
+                        }
+                    }
+                    chosenMirror->nextConnectionTick = settings.rampUpConnections
+                        ? GetTickCount64() + settings.rampUpDelayMs : 0;
+                    chosenMirror->throttleUntilTick = 0;
                     chosenMirror->state = chosenMirror->active ? L"Sample-compatible - ranges ready" : L"Removed";
-                } else if (d.cancelRequested.load()) {
+                } else if (d.cancelRequested.load() || transfer.paused) {
                     segment.state = 0;
-                    chosenMirror->state = chosenMirror->active ? L"Ready" : L"Removed";
+                    if (transfer.bytesFlushed) segment.committedBytes += transfer.received;
+                    chosenMirror->state = chosenMirror->active ? (transfer.paused ? L"Paused" : L"Ready") : L"Removed";
                 } else if (transfer.removed || !chosenMirror->active) {
                     segment.state = 0;
+                    if (transfer.bytesFlushed) segment.committedBytes += transfer.received;
                     chosenMirror->state = L"Removed";
                 } else {
                     segment.state = 0;
+                    if (transfer.bytesFlushed) segment.committedBytes += transfer.received;
+                    ++chosenMirror->failedChunks;
                     ++chosenMirror->failures;
                     chosenMirror->lastError = transfer.error;
-                    chosenMirror->state = L"Range failed";
-                    if (transfer.protocolMismatch || chosenMirror->failures >= 2) {
+                    const DownloaderSettings settings = GetSettings();
+                    const bool retryable = IsRetryableStatus(transfer.httpStatus) &&
+                                           CanRetry(settings, static_cast<unsigned int>(chosenMirror->failures - 1));
+                    if (retryable) {
+                        const unsigned int retryDelay = transfer.retryAfterSeconds > 0
+                            ? transfer.retryAfterSeconds : settings.retryDelaySeconds;
+                        chosenMirror->throttleUntilTick = GetTickCount64() +
+                            static_cast<uint64_t>(retryDelay) * 1000ull;
+                        if (settings.reduceConnectionsOnThrottle &&
+                            (transfer.httpStatus == 509 || transfer.httpStatus == 429) &&
+                            settings.maxConnectionsPerMirror > 1) {
+                            const int currentLimit = chosenMirror->throttleConnectionLimit > 0
+                                ? chosenMirror->throttleConnectionLimit : settings.maxConnectionsPerMirror;
+                            chosenMirror->throttleConnectionLimit = std::max(1, currentLimit - 1);
+                            chosenMirror->successesSinceThrottle = 0;
+                        }
+                        chosenMirror->state = transfer.httpStatus == 509 || transfer.httpStatus == 429
+                            ? L"Server throttled; retry scheduled" : L"Connection failed; retry scheduled";
+                    } else {
+                        chosenMirror->state = L"Range failed";
                         chosenMirror->rangeFailed = true;
                     }
-                    if (segment.attempts >= kMaxSegmentAttempts) {
-                        d.engineFallbackNeeded = true;
-                        d.statusText = L"A range failed repeatedly; switching to fallback";
+                    if (transfer.protocolMismatch) {
+                        chosenMirror->rangeFailed = true;
+                        chosenMirror->state = L"Range unsupported; sequential mode not selected";
                     }
+                }
+                // Publish the paused state only after the final worker has recorded
+                // its flushed byte offset and reset the in-flight counters. This is
+                // the point at which the UI may safely enable Resume and persist.
+                if (d.pauseRequested.load() && d.activeRequests == 0) {
+                    d.pauseSettled = true;
+                    d.phase = DownloadPhase::Paused;
+                    d.statusText = L"Paused";
+                    d.speedBps = 0.0;
                 }
                 d.cv.notify_all();
             }
@@ -1360,56 +1957,74 @@ void Download::RunParallel() {
 
     std::lock_guard lock(mutex);
     if (cancelRequested.load()) return;
-    if (completedSegments == static_cast<int>(segments.size())) {
-        // Finalize after releasing the mutex; doing file I/O while locked would block the UI.
+    if (pauseRequested.load() && activeRequests == 0) {
+        // RunParallel has joined every worker: all active range requests have
+        // flushed their durable byte offsets and no writer can still touch the file.
+        pauseSettled = true;
+        phase = DownloadPhase::Paused;
+        statusText = L"Paused";
+        speedBps = 0.0;
+        cv.notify_all();
     }
 }
 
 bool Download::RunFallback() {
     {
         std::lock_guard lock(mutex);
-        phase = DownloadPhase::DownloadingFallback;
         parallelMode = false;
-        statusText = L"Downloading from one mirror at a time";
+        phase = pauseRequested.load() ? DownloadPhase::Paused : DownloadPhase::DownloadingFallback;
+        statusText = pauseRequested.load() ? L"Paused" : L"Downloading from one mirror at a time";
         fallbackBytes = 0;
-        for (auto& mirror : mirrors) mirror->fallbackTried = false;
+        for (auto& mirror : mirrors) {
+            mirror->fallbackTried = false;
+            mirror->fallbackAttempts = 0;
+        }
     }
 
     while (!cancelRequested.load()) {
+        if (pauseRequested.load()) {
+            std::unique_lock pauseLock(mutex);
+            pauseSettled = true;
+            phase = DownloadPhase::Paused;
+            statusText = L"Paused";
+            cv.notify_all();
+            cv.wait_for(pauseLock, std::chrono::milliseconds(200), [&] {
+                return cancelRequested.load() || !pauseRequested.load();
+            });
+            continue;
+        }
         std::shared_ptr<Mirror> mirror;
+        uint64_t waitUntil = 0;
         {
             std::unique_lock lock(mutex);
-            auto choose = [&]() -> std::shared_ptr<Mirror> {
-                for (const auto& candidate : mirrors) {
-                    if (candidate->active && candidate->probeDone && candidate->probeOk && candidate->compatible &&
-                        !candidate->fallbackTried) return candidate;
-                }
-                return {};
-            };
-            while (!cancelRequested.load()) {
-                if (restartAsParallel) return false;
-                mirror = choose();
-                if (mirror) break;
-                const bool pendingProbe = std::any_of(mirrors.begin(), mirrors.end(), [](const auto& m) { return m->probePending; });
-                if (pendingProbe) {
-                    statusText = L"Waiting for mirror checks";
-                    cv.wait_for(lock, std::chrono::milliseconds(250));
+            if (restartAsParallel) return false;
+            const uint64_t now = GetTickCount64();
+            for (const auto& candidate : mirrors) {
+                if (!candidate->active || !candidate->probeDone || !candidate->probeOk ||
+                    !candidate->compatible || candidate->fallbackTried) continue;
+                if (candidate->throttleUntilTick > now) {
+                    if (waitUntil == 0 || candidate->throttleUntilTick < waitUntil) waitUntil = candidate->throttleUntilTick;
                     continue;
                 }
-                const bool anyActiveCompatible = std::any_of(mirrors.begin(), mirrors.end(), [](const auto& m) {
-                    return m->active && m->probeDone && m->probeOk && m->compatible;
+                if (!mirror || candidate->fallbackAttempts < mirror->fallbackAttempts) mirror = candidate;
+            }
+
+            if (!mirror) {
+                if (restartAsParallel) return false;
+                const bool pendingProbe = std::any_of(mirrors.begin(), mirrors.end(), [](const auto& m) {
+                    return m->active && (m->probePending || m->probeRunning);
                 });
-                if (anyActiveCompatible) {
-                    // Each active compatible mirror has already been attempted; reset only
-                    // after a dynamic mirror has arrived, otherwise report a useful failure.
-                    lastError = L"All compatible mirrors failed";
-                    return false;
+                const bool anyRetryable = std::any_of(mirrors.begin(), mirrors.end(), [](const auto& m) {
+                    return m->active && m->probeDone && m->probeOk && m->compatible && !m->fallbackTried;
+                });
+                if (pendingProbe || anyRetryable) {
+                    statusText = waitUntil ? L"Waiting before retrying a throttled mirror" : L"Waiting for mirror checks";
+                    cv.wait_for(lock, std::chrono::milliseconds(200));
+                    continue;
                 }
-                lastError = L"No active compatible mirror is available";
+                lastError = L"All compatible mirrors failed";
                 return false;
             }
-            if (cancelRequested.load()) return false;
-            mirror->fallbackTried = true;
             mirror->state = L"Downloading full file";
             fallbackBytes = 0;
             if (mirror->sizeKnown) {
@@ -1426,6 +2041,7 @@ bool Download::RunFallback() {
             result = DownloadFull(*this, mirror);
         }
         if (cancelRequested.load()) return false;
+
         {
             std::lock_guard lock(mutex);
             if (result.httpStatus != 0) mirror->lastHttpStatus = result.httpStatus;
@@ -1443,11 +2059,23 @@ bool Download::RunFallback() {
                 statusText = L"Download complete; finalizing file";
                 return true;
             }
-            if (result.httpStatus != 0) mirror->lastHttpStatus = result.httpStatus;
+
+            ++mirror->fallbackAttempts;
             mirror->lastError = result.error;
-            mirror->state = mirror->active ? L"Failed; trying next mirror" : L"Removed";
-            if (restartAsParallel) return false;
-            // A failed mirror is not retried again in this fallback pass.
+            const DownloaderSettings settings = GetSettings();
+            const bool retryable = IsRetryableStatus(result.httpStatus) &&
+                CanRetry(settings, static_cast<unsigned int>(mirror->fallbackAttempts - 1));
+            if (retryable) {
+                const unsigned int retryDelay = result.retryAfterSeconds > 0
+                    ? result.retryAfterSeconds : settings.retryDelaySeconds;
+                mirror->throttleUntilTick = GetTickCount64() +
+                    static_cast<uint64_t>(retryDelay) * 1000ull;
+                mirror->state = result.httpStatus == 509 || result.httpStatus == 429
+                    ? L"Server throttled; retry scheduled" : L"Connection failed; retry scheduled";
+            } else {
+                mirror->fallbackTried = true;
+                mirror->state = mirror->active ? L"Failed; trying another mirror" : L"Removed";
+            }
             cv.notify_all();
         }
     }
@@ -1474,6 +2102,54 @@ void Download::CleanupPartFile() {
     if (!partPath.empty()) DeleteFileW(partPath.c_str());
 }
 
+void Download::PreservePartialFile() {
+    if (partPath.empty()) return;
+    HANDLE file = CreateFileW(partPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    FlushFileBuffers(file);
+    CloseHandle(file);
+
+    const std::wstring base = finalPath + L".partial";
+    for (unsigned int index = 0; index < 10000; ++index) {
+        std::wstring candidate = base;
+        if (index > 0) candidate = finalPath + L" (" + std::to_wstring(index) + L").partial";
+        if (MoveFileExW(partPath.c_str(), candidate.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            std::lock_guard lock(mutex);
+            partPath = candidate;
+            partialPath = candidate;
+            partialKept = true;
+            return;
+        }
+        const DWORD error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) break;
+    }
+    std::lock_guard lock(mutex);
+    lastError = L"Could not rename the partial file; it remains at: " + partPath;
+}
+
+void Download::FinishCancelled() {
+    if (keepPartialOnCancel.load()) {
+        PreservePartialFile();
+        bool kept = false;
+        std::wstring keptPath;
+        {
+            std::lock_guard lock(mutex);
+            kept = partialKept;
+            keptPath = partialPath;
+        }
+        if (kept) {
+            SetStatus(*this, DownloadPhase::CancelledKept, L"Cancelled - partial file kept: " + keptPath);
+            return;
+        }
+        // If preservation failed, do not silently delete the user's downloaded bytes.
+        SetStatus(*this, DownloadPhase::CancelledKept, L"Cancelled - partial file remains at: " + partPath);
+        return;
+    }
+    CleanupPartFile();
+    SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled - partial data deleted");
+}
+
 void Download::Run() {
     {
         std::lock_guard lock(mutex);
@@ -1483,15 +2159,33 @@ void Download::Run() {
     }
     ProbeInitialMirrors();
     if (cancelRequested.load()) {
-        CleanupPartFile();
-        SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled");
+        FinishCancelled();
         return;
+    }
+    {
+        std::lock_guard lock(mutex);
+        if (restorePending) {
+            const bool referenceMatches = rangeReferenceReady && sizeKnown &&
+                totalSize == restoredTotalSize &&
+                referencePrefixHash == restoredReferencePrefixHash &&
+                referenceMiddleHash == restoredReferenceMiddleHash &&
+                referenceSuffixHash == restoredReferenceSuffixHash;
+            if (!referenceMatches) {
+                // A mirror changed content or metadata since the last session. Never
+                // combine old completed ranges with a new version of the file.
+                restorePending = false;
+                restoredCompletedSegmentIndices.clear();
+                restoredPartialSegmentBytes.clear();
+                restoredSegmentBytes = 0;
+                persistentSegmentBytes = 0;
+            }
+        }
     }
 
     bool canParallel = false;
     {
         std::lock_guard lock(mutex);
-        canParallel = rangeReferenceReady && referenceSizeKnown && totalSize > 0 &&
+        canParallel = !singleMirrorOnly && rangeReferenceReady && referenceSizeKnown && totalSize > 0 &&
             std::any_of(mirrors.begin(), mirrors.end(), [&](const auto& m) {
                 return m->active && m->probeDone && m->probeOk && m->compatible && m->rangeCapable &&
                        !m->rangeFailed && m->sizeKnown && m->size == totalSize &&
@@ -1499,89 +2193,79 @@ void Download::Run() {
             });
     }
 
-    if (canParallel) {
-        RunParallel();
-        if (cancelRequested.load()) {
-            CleanupPartFile();
-            SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled");
-            return;
-        }
-        bool complete = false;
-        bool fallback = false;
+    if (!canParallel && !singleMirrorOnly) {
+        // Parallel mode is an explicit per-download choice. Never silently switch
+        // this file to one mirror just because range checks or a transfer failed.
         {
             std::lock_guard lock(mutex);
-            complete = !segments.empty() && completedSegments == static_cast<int>(segments.size());
-            fallback = engineFallbackNeeded || restartAsParallel || !complete;
+            restorePending = false;
+            restoredCompletedSegmentIndices.clear();
+            restoredPartialSegmentBytes.clear();
+            restoredSegmentBytes = 0;
+            persistentSegmentBytes = 0;
+            lastError = L"Parallel mode was selected, but no compatible mirror currently supports HTTP byte ranges. Choose single-mirror mode explicitly to download sequentially.";
         }
-        if (complete) {
-            std::wstring error;
-            if (FinalizeFile(error)) {
-                SetStatus(*this, DownloadPhase::Completed, L"Completed");
-                return;
-            }
-            {
-                std::lock_guard lock(mutex);
-                lastError = error;
-            }
-            CleanupPartFile();
-            SetStatus(*this, DownloadPhase::Failed, L"Failed to finalize file");
-            return;
-        }
-        if (fallback) {
-            {
-                std::lock_guard lock(mutex);
-                // A fallback starts from byte zero; no partial range data is retained.
-                completedBytes = 0;
-                completedSegments = 0;
-                segments.clear();
-                parallelMode = false;
-                engineFallbackNeeded = false;
-                restartAsParallel = false;
-                phase = DownloadPhase::DownloadingFallback;
-                statusText = L"Restarting safely with sequential fallback";
-            }
-            const bool fallbackSucceeded = RunFallback();
+        CleanupPartFile();
+        SetStatus(*this, DownloadPhase::Failed, L"Parallel mode unavailable");
+        return;
+    }
+    if (!canParallel && singleMirrorOnly) {
+        std::lock_guard lock(mutex);
+        restorePending = false;
+        restoredCompletedSegmentIndices.clear();
+        restoredPartialSegmentBytes.clear();
+        restoredSegmentBytes = 0;
+        persistentSegmentBytes = 0;
+    }
+
+    if (canParallel) {
+        for (;;) {
+            RunParallel();
             if (cancelRequested.load()) {
-                CleanupPartFile();
-                SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled");
+                FinishCancelled();
                 return;
             }
-            bool shouldRestartParallel = false;
+
+            bool pausedAndWaiting = false;
+            bool workerPoolExitedForPause = false;
+            bool complete = false;
+            bool parallelStopped = false;
             {
-                std::lock_guard lock(mutex);
-                shouldRestartParallel = restartAsParallel;
-            }
-            if (shouldRestartParallel) {
-                {
-                    std::lock_guard lock(mutex);
-                    engineFallbackNeeded = false;
-                    restartAsParallel = false;
-                }
-                RunParallel();
-                if (cancelRequested.load()) {
-                    CleanupPartFile();
-                    SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled");
-                    return;
-                }
-                bool parallelDone = false;
-                {
-                    std::lock_guard lock(mutex);
-                    parallelDone = !segments.empty() && completedSegments == static_cast<int>(segments.size());
-                }
-                if (parallelDone) {
-                    std::wstring error;
-                    if (FinalizeFile(error)) SetStatus(*this, DownloadPhase::Completed, L"Completed");
-                    else {
-                        std::lock_guard lock(mutex);
-                        lastError = error;
-                        CleanupPartFile();
-                        phase = DownloadPhase::Failed;
-                        statusText = L"Failed to finalize file";
-                        terminal = true;
+                std::unique_lock lock(mutex);
+                workerPoolExitedForPause = parallelPoolPaused;
+                complete = !segments.empty() && completedSegments == static_cast<int>(segments.size());
+                if (pauseRequested.load() && !complete) {
+                    // The worker pool has returned and joined. A pause is a normal
+                    // state transition, not a transfer failure and never a reason
+                    // to invoke the single-mirror path.
+                    pauseSettled = (activeRequests == 0);
+                    if (pauseSettled) {
+                        phase = DownloadPhase::Paused;
+                        statusText = L"Paused";
+                        speedBps = 0.0;
                     }
-                    return;
+                    cv.notify_all();
+                    cv.wait(lock, [&] {
+                        return cancelRequested.load() || !pauseRequested.load();
+                    });
+                    pausedAndWaiting = true;
+                } else {
+                    parallelStopped = !complete;
                 }
-            } else if (fallbackSucceeded) {
+            }
+
+            if (cancelRequested.load()) {
+                FinishCancelled();
+                return;
+            }
+            if (pausedAndWaiting || (workerPoolExitedForPause && !complete)) {
+                // Re-enter RunParallel with the same in-memory segment table.
+                // PrepareParallelFile explicitly preserves it and only verifies
+                // the partial file length, so completed chunks are not reset.
+                continue;
+            }
+
+            if (complete) {
                 std::wstring error;
                 if (FinalizeFile(error)) {
                     SetStatus(*this, DownloadPhase::Completed, L"Completed");
@@ -1595,12 +2279,29 @@ void Download::Run() {
                 SetStatus(*this, DownloadPhase::Failed, L"Failed to finalize file");
                 return;
             }
+
+            if (parallelStopped) {
+                std::wstring failure;
+                {
+                    std::lock_guard lock(mutex);
+                    engineFallbackNeeded = false;
+                    restartAsParallel = false;
+                    failure = lastError.empty()
+                        ? L"Parallel transfer stopped because no compatible range request could continue. The download was not switched to single-mirror mode."
+                        : lastError;
+                    lastError = failure;
+                }
+                // Keep the partial file and its per-chunk offsets so a user can add
+                // a usable mirror and Retry without discarding already completed work.
+                SetStatus(*this, DownloadPhase::Failed, L"Parallel download stopped");
+                return;
+            }
+            break;
         }
     } else {
         const bool succeeded = RunFallback();
         if (cancelRequested.load()) {
-            CleanupPartFile();
-            SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled");
+            FinishCancelled();
             return;
         }
         bool shouldRestartParallel = false;
@@ -1624,12 +2325,12 @@ void Download::Run() {
                 std::wstring error;
                 if (FinalizeFile(error)) SetStatus(*this, DownloadPhase::Completed, L"Completed");
                 else {
-                    std::lock_guard lock(mutex);
-                    lastError = error;
-                    phase = DownloadPhase::Failed;
-                    statusText = L"Failed to finalize file";
-                    terminal = true;
+                    {
+                        std::lock_guard lock(mutex);
+                        lastError = error;
+                    }
                     CleanupPartFile();
+                    SetStatus(*this, DownloadPhase::Failed, L"Failed to finalize file");
                 }
                 return;
             }
@@ -1650,8 +2351,7 @@ void Download::Run() {
     }
 
     if (cancelRequested.load()) {
-        CleanupPartFile();
-        SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled");
+        FinishCancelled();
     } else {
         std::wstring failure;
         {
