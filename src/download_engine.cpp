@@ -99,6 +99,7 @@ struct ProbeResult {
     bool rangeCapable = false;
     std::wstring etag;
     std::wstring lastModified;
+    std::wstring suggestedFileName;
     std::vector<unsigned char> prefix;
     std::vector<unsigned char> middle;
     std::vector<unsigned char> suffix;
@@ -253,6 +254,74 @@ std::wstring QueryCustomHeader(HINTERNET request, const wchar_t* headerName) {
     return std::wstring(buffer.data());
 }
 
+std::wstring DecodeHeaderFilenameValue(const std::wstring& value) {
+    std::vector<char> bytes;
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == L'%' && i + 2 < value.size()) {
+            wchar_t hex[3]{value[i + 1], value[i + 2], L'\0'};
+            wchar_t* end = nullptr;
+            const long decoded = wcstol(hex, &end, 16);
+            if (end && *end == L'\0') {
+                bytes.push_back(static_cast<char>(decoded));
+                i += 2;
+                continue;
+            }
+        }
+        if (value[i] <= 0x7f) bytes.push_back(static_cast<char>(value[i]));
+        else return value;
+    }
+    if (bytes.empty()) return L"";
+    const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                                           static_cast<int>(bytes.size()), nullptr, 0);
+    if (count <= 0) return L"";
+    std::wstring decoded(static_cast<size_t>(count), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                        static_cast<int>(bytes.size()), decoded.data(), count);
+    return decoded;
+}
+
+std::wstring ParseContentDispositionFilename(const std::wstring& header) {
+    std::wstring plainFilename;
+    size_t position = 0;
+    while (position < header.size()) {
+        while (position < header.size() && (header[position] == L';' || iswspace(header[position]))) ++position;
+        const size_t keyStart = position;
+        while (position < header.size() && header[position] != L'=' && header[position] != L';') ++position;
+        if (position >= header.size() || header[position] != L'=') {
+            while (position < header.size() && header[position] != L';') ++position;
+            continue;
+        }
+        std::wstring key = Trim(header.substr(keyStart, position - keyStart));
+        std::transform(key.begin(), key.end(), key.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+        ++position;
+        std::wstring value;
+        if (position < header.size() && header[position] == L'"') {
+            ++position;
+            while (position < header.size()) {
+                if (header[position] == L'\\' && position + 1 < header.size()) {
+                    value.push_back(header[++position]);
+                    ++position;
+                } else if (header[position] == L'"') {
+                    ++position;
+                    break;
+                } else value.push_back(header[position++]);
+            }
+        } else {
+            const size_t start = position;
+            while (position < header.size() && header[position] != L';') ++position;
+            value = Trim(header.substr(start, position - start));
+        }
+        if (key == L"filename*") {
+            const size_t marker = value.find(L"''");
+            if (marker != std::wstring::npos) {
+                const std::wstring extended = DecodeHeaderFilenameValue(value.substr(marker + 2));
+                if (!extended.empty()) return extended;
+            }
+        } else if (key == L"filename" && !value.empty()) plainFilename = value;
+    }
+    return plainFilename;
+}
+
 
 bool ParseUnsigned(const std::wstring& s, uint64_t& result) {
     if (s.empty()) return false;
@@ -343,6 +412,8 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         }
         result.etag = QueryHeader(head->request, WINHTTP_QUERY_ETAG);
         result.lastModified = QueryHeader(head->request, WINHTTP_QUERY_LAST_MODIFIED);
+        result.suggestedFileName = ParseContentDispositionFilename(
+            QueryCustomHeader(head->request, L"Content-Disposition"));
     }
 
     // A successful HEAD with a known zero length is enough to identify an empty file.
@@ -363,6 +434,9 @@ ProbeResult ProbeUrl(const std::wstring& url) {
     }
     result.httpStatus = rangeStatus;
     result.retryAfterSeconds = GetRetryAfterSeconds(prefixResponse->request);
+    if (result.suggestedFileName.empty())
+        result.suggestedFileName = ParseContentDispositionFilename(
+            QueryCustomHeader(prefixResponse->request, L"Content-Disposition"));
     if (rangeStatus != 200 && rangeStatus != 206) {
         result.error = L"HTTP " + std::to_wstring(rangeStatus);
         return result;
@@ -1003,8 +1077,9 @@ std::vector<std::wstring> ParseUrlLines(const std::wstring& text) {
 
 Download::Download(const std::wstring& folder, const std::wstring& name,
                    const std::vector<std::wstring>& urls, const DownloadResumeState* resume,
-                   bool requestedSingleMirrorOnly)
-    : outputFolder(folder), fileName(name), singleMirrorOnly(requestedSingleMirrorOnly) {
+                   bool requestedSingleMirrorOnly, bool requestedAutoGeneratedName)
+    : outputFolder(folder), fileName(name), fileNameAutoGenerated(requestedAutoGeneratedName),
+      singleMirrorOnly(requestedSingleMirrorOnly) {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(outputFolder), ec);
     fileName = SanitizeOutputName(fileName.empty() ? L"download.bin" : fileName);
@@ -1449,6 +1524,23 @@ void Download::ProbeOne(const std::shared_ptr<Mirror>& mirror) {
         mirror->probeDone = true;
         mirror->probeAttempts = static_cast<int>(retriesMade + 1);
         mirror->probeOk = result.ok;
+        mirror->suggestedFileName = result.suggestedFileName;
+        if (result.ok && fileNameAutoGenerated && !result.suggestedFileName.empty() &&
+            phase == DownloadPhase::Probing && completedBytes == 0 && fallbackBytes == 0 &&
+            networkBytes == 0 && segments.empty()) {
+            const std::wstring suggested = SanitizeOutputName(result.suggestedFileName);
+            if (!suggested.empty() && suggested != fileName) {
+                // The initial .part file is only an empty reservation at this point.
+                if (!partPath.empty()) DeleteFileW(partPath.c_str());
+                fileName = UniqueName(outputFolder, suggested);
+                finalPath = (std::filesystem::path(outputFolder) / fileName).wstring();
+                partPath = finalPath + L".linkforge.part";
+                HANDLE reservation = CreateFileW(partPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                                  nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (reservation != INVALID_HANDLE_VALUE) CloseHandle(reservation);
+                fileNameAutoGenerated = false; // First usable server-provided name wins.
+            }
+        }
         mirror->lastHttpStatus = result.httpStatus;
         mirror->sizeKnown = result.sizeKnown;
         mirror->size = result.size;

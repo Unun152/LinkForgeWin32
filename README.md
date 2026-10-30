@@ -92,3 +92,7 @@ Automatic chunk sizing uses the file size and count of compatible range-capable 
 ## Speed and ETA calculation
 
 The main queue's **Speed** value is a short-interval network-throughput reading and can react quickly to bursts. **ETA** is intentionally steadier: it uses a rolling 8-second average of actual file progress, refreshed every 500 ms after a 2-second warm-up. Retransmitted bytes do not count as completed progress for ETA. The ETA averaging window is cleared on pause/resume so time spent paused is not included; the estimate becomes available again after enough post-resume samples have accumulated.
+
+### Automatic output filenames
+
+When the filename field is left blank, LinkForge first uses a filename supplied by the server's HTTP `Content-Disposition` response header (preferring RFC 5987 `filename*` when available). If the server does not provide a usable name, the existing URL-path filename fallback is retained. User-entered filenames always take precedence.
