@@ -134,6 +134,7 @@ public:
 
     void Start();
     void RequestCancel(bool keepPartial = false);
+    void RequestShutdown(); // stop I/O for process exit without cancelling or renaming the partial file
     void Pause();
     void Resume();
     bool IsPaused() const;
@@ -209,6 +210,7 @@ public:
     bool parallelMode = false;
     bool singleMirrorOnly = false; // explicit per-download mode; never silently downgrade parallel to sequential
     std::atomic<bool> cancelRequested{false};
+    std::atomic<bool> shutdownRequested{false};
     std::atomic<bool> keepPartialOnCancel{false};
     std::atomic<bool> stopProbeRequests{false};
     bool partialKept = false;

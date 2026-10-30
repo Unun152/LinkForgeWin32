@@ -91,6 +91,7 @@ HWND g_statusText = nullptr;
 HWND g_pauseButton = nullptr;
 std::wstring g_configPath;
 std::wstring g_downloadsStatePath;
+std::wstring g_lastSaveFolder;
 uint64_t g_lastPersistTick = 0;
 std::vector<uint64_t> g_lastProgressBytes;
 std::vector<std::shared_ptr<Download>> g_autoResumeDownloads;
@@ -194,6 +195,11 @@ void LoadSettingsFromFile(linkforge::DownloaderSettings& settings) {
     settings.retryDelaySeconds = GetPrivateProfileIntW(L"Retry", L"RetryDelaySeconds", settings.retryDelaySeconds, g_configPath.c_str());
     settings.maxRetriesPerMirror = GetPrivateProfileIntW(L"Retry", L"MaxRetriesPerMirror", settings.maxRetriesPerMirror, g_configPath.c_str());
     settings.segmentSizeMB = GetPrivateProfileIntW(L"Download", L"SegmentSizeMB", settings.segmentSizeMB, g_configPath.c_str());
+    const std::wstring defaultSaveFolder = GetDownloadsFolder();
+    wchar_t lastSaveFolder[32768]{};
+    GetPrivateProfileStringW(L"Paths", L"LastSaveFolder", defaultSaveFolder.c_str(),
+                             lastSaveFolder, static_cast<DWORD>(std::size(lastSaveFolder)), g_configPath.c_str());
+    g_lastSaveFolder = lastSaveFolder[0] ? lastSaveFolder : defaultSaveFolder;
     settings.sendUserAgent = GetPrivateProfileIntW(L"HTTP", L"SendUserAgent", settings.sendUserAgent ? 1 : 0, g_configPath.c_str()) != 0;
     wchar_t userAgent[513]{};
     GetPrivateProfileStringW(L"HTTP", L"UserAgent", settings.userAgent.c_str(), userAgent,
@@ -222,6 +228,7 @@ bool SaveSettingsToFile(const linkforge::DownloaderSettings& settings) {
     ok &= write(L"Retry", L"RetryDelaySeconds", std::to_wstring(settings.retryDelaySeconds));
     ok &= write(L"Retry", L"MaxRetriesPerMirror", std::to_wstring(settings.maxRetriesPerMirror));
     ok &= write(L"Download", L"SegmentSizeMB", std::to_wstring(settings.segmentSizeMB));
+    if (!g_lastSaveFolder.empty()) ok &= write(L"Paths", L"LastSaveFolder", g_lastSaveFolder);
     ok &= write(L"HTTP", L"SendUserAgent", settings.sendUserAgent ? L"1" : L"0");
     ok &= write(L"HTTP", L"UserAgent", settings.userAgent);
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_configPath.c_str());
@@ -328,7 +335,7 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
             prefixHash = download->referencePrefixHash ? download->referencePrefixHash : download->restoredReferencePrefixHash;
             middleHash = download->referenceMiddleHash ? download->referenceMiddleHash : download->restoredReferenceMiddleHash;
             suffixHash = download->referenceSuffixHash ? download->referenceSuffixHash : download->restoredReferenceSuffixHash;
-            userPaused = download->userPaused;
+            userPaused = download->userPaused && !download->terminal;
             completed = download->phase == DownloadPhase::Completed;
             failed = download->phase == DownloadPhase::Failed;
             cancelled = download->phase == DownloadPhase::Cancelled;
@@ -354,7 +361,7 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
             else if (userPaused || download->phase == DownloadPhase::Paused) phaseName = L"Paused";
             else phaseName = L"Active";
             autoResume = !urls.empty() && !completed && !failed && !cancelled && !userPaused && !cancelledKept;
-            if (applicationShutdown && !userPaused &&
+            if (applicationShutdown && !userPaused && !completed && !failed && !cancelled && !cancelledKept &&
                 std::find(g_shutdownResumeDownloads.begin(), g_shutdownResumeDownloads.end(), download.get()) != g_shutdownResumeDownloads.end())
                 autoResume = true;
         }
@@ -475,7 +482,8 @@ void LoadDownloadsFromFile() {
         }
         resume.wasCancelled = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"Cancelled";
         resume.wasCancelledKept = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"CancelledKept";
-        resume.wasPaused = GetPrivateProfileIntW(section.c_str(), L"UserPaused", 0, g_downloadsStatePath.c_str()) != 0;
+        resume.wasPaused = GetPrivateProfileIntW(section.c_str(), L"UserPaused", 0, g_downloadsStatePath.c_str()) != 0 &&
+            !resume.wasCompleted && !resume.wasFailed && !resume.wasCancelled && !resume.wasCancelledKept;
         const bool autoResume = GetPrivateProfileIntW(section.c_str(), L"AutoResume", 0, g_downloadsStatePath.c_str()) != 0;
         const int chunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"CompletedChunkCount", 0,
                                                                                   g_downloadsStatePath.c_str())), 0, 10000);
@@ -1343,10 +1351,13 @@ bool ShowTextDialog(HWND owner, bool mirrorMode, const std::wstring& initialFold
 
 void AddDownload(HWND owner) {
     std::vector<std::wstring> urls;
-    std::wstring folder = GetDownloadsFolder();
+    std::wstring folder = g_lastSaveFolder.empty() ? GetDownloadsFolder() : g_lastSaveFolder;
     std::wstring filename;
     bool singleMirrorOnly = false;
     if (!ShowTextDialog(owner, false, folder, urls, folder, filename, &singleMirrorOnly)) return;
+    g_lastSaveFolder = folder;
+    if (WritePrivateProfileStringW(L"Paths", L"LastSaveFolder", g_lastSaveFolder.c_str(), g_configPath.c_str()))
+        WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_configPath.c_str());
     if (filename.empty()) filename = linkforge::MakeFileNameFromUrl(urls.front());
     auto download = std::make_shared<Download>(folder, filename, urls, nullptr, singleMirrorOnly);
     g_downloads.push_back(download);
@@ -1788,15 +1799,22 @@ void ShutdownDownloadJobs() {
     for (const auto& download : g_downloads) {
         bool userPaused = false;
         bool terminal = false;
+        bool alreadyCancelling = false;
         {
             std::lock_guard lock(download->mutex);
             userPaused = download->userPaused;
             terminal = download->terminal;
+            alreadyCancelling = download->cancelRequested.load();
         }
-        if (!userPaused && !terminal) g_shutdownResumeDownloads.push_back(download.get());
-        // Graceful shutdown stops I/O and leaves a recoverable partial file. The
-        // periodic autosave remains the fallback for power loss without notification.
-        download->RequestCancel(true);
+        // An explicit user cancellation must remain cancelled if shutdown occurs
+        // before the cancellation worker has finished.
+        if (!userPaused && !terminal && !alreadyCancelling) g_shutdownResumeDownloads.push_back(download.get());
+        if (!terminal && !alreadyCancelling) {
+            // Process shutdown is distinct from user Cancel: preserve the resumable
+            // .linkforge.part and its queue record. Active jobs auto-resume next run;
+            // jobs the user had paused remain paused.
+            download->RequestShutdown();
+        }
     }
     for (const auto& download : g_downloads) download->Join();
     PersistDownloadsToFile(true);
@@ -2101,6 +2119,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     g_instance = instance;
     g_configPath = GetConfigFilePath();
     g_downloadsStatePath = GetDownloadsStateFilePath();
+    g_lastSaveFolder = GetDownloadsFolder();
     linkforge::DownloaderSettings startupSettings;
     LoadSettingsFromFile(startupSettings);
     linkforge::SetSettings(startupSettings);

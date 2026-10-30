@@ -1040,6 +1040,8 @@ Download::Download(const std::wstring& folder, const std::wstring& name,
             phase = DownloadPhase::Paused;
             statusText = L"Paused";
             userPaused = true;
+            pauseSettled = true; // A persisted pause is already a completed checkpoint.
+            pauseCheckpointPending = false;
             pauseRequested.store(true);
             terminal = false;
         } else if (resume->wasCancelled) {
@@ -1093,6 +1095,7 @@ void Download::Start() {
     phase = DownloadPhase::Probing;
     statusText = L"Checking mirrors";
     cancelRequested.store(false);
+    shutdownRequested.store(false);
     keepPartialOnCancel.store(false);
     stopProbeRequests.store(false);
     speedBps = 0.0;
@@ -1106,6 +1109,13 @@ void Download::Start() {
 
 void Download::RequestCancel(bool keepPartial) {
     keepPartialOnCancel.store(keepPartial);
+    cancelRequested.store(true);
+    cv.notify_all();
+}
+
+void Download::RequestShutdown() {
+    shutdownRequested.store(true);
+    stopProbeRequests.store(true);
     cancelRequested.store(true);
     cv.notify_all();
 }
@@ -2129,6 +2139,24 @@ void Download::PreservePartialFile() {
 }
 
 void Download::FinishCancelled() {
+    if (shutdownRequested.load()) {
+        // Process shutdown is not a user cancellation. Keep the resumable
+        // .linkforge.part file and its durable range checkpoints in place.
+        // User-paused downloads remain paused; active downloads are queued for
+        // automatic resume on the next application launch.
+        {
+            std::lock_guard lock(mutex);
+            pauseSettled = true;
+            pauseCheckpointPending = false;
+            phase = userPaused ? DownloadPhase::Paused : DownloadPhase::Queued;
+            statusText = userPaused ? L"Paused" : L"Queued to resume";
+            terminal = false;
+            speedBps = 0.0;
+            etaSpeedBps = 0.0;
+        }
+        cv.notify_all();
+        return;
+    }
     if (keepPartialOnCancel.load()) {
         PreservePartialFile();
         bool kept = false;
