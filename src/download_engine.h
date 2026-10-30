@@ -12,7 +12,6 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -170,8 +169,6 @@ public:
     uint64_t firstTransferTick = 0;
     uint64_t endTransferTick = 0;
     double speedBps = 0.0; // short-interval network throughput for the Speed column
-    double etaSpeedBps = 0.0; // rolling average of actual progress, used only for ETA
-    std::deque<std::pair<uint64_t, uint64_t>> etaSpeedSamples; // tick -> completed + in-flight progress bytes
     uint64_t lastSpeedSampleBytes = 0;
     uint64_t speedSampleTick = 0;
 
@@ -241,6 +238,7 @@ private:
 
 DownloaderSettings GetSettings();
 void SetSettings(const DownloaderSettings& settings);
+int GetActiveConnectionCount();
 bool InitializeHttp();
 void ShutdownHttp();
 std::wstring PhaseToString(DownloadPhase phase);

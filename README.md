@@ -29,7 +29,7 @@ cmake --build build --config Release
 
 **Parallel mirrors** means LinkForge uses compatible mirrors concurrently and requests different byte ranges. If ranges are unavailable, the download fails with an explicit explanation; LinkForge does not silently switch to a single URL. Retryable HTTP/network errors (including HTTP 509/429/5xx) are retried according to the retry settings while the job remains in parallel mode. **Single mirror only** means one URL is used at a time, with the next mirror tried only if needed. This is an explicit choice made for that file.
 
-The mirror details window shows total mirror count, active/removed mirror count, the actual chunk size selected for that file, total completed/active/partial chunks, and per-mirror current/average speed, bytes received, HTTP status, active connections, and completed/active/failed chunk counts. Per-mirror chunk counts describe assignments completed during the current application session; the total completed-chunk count is derived from the durable file state. Mirrors can be added or removed while a download is running.
+The mirror details window shows total mirror count, active/removed mirror count, the actual chunk size selected for that file, total completed/active/partial chunks, and per-mirror current/average speed, bytes received, HTTP status, active connections, and completed/active/failed chunk counts. The main-window status line also shows the current global number of active HTTP request slots across downloads, including mirror probes, range transfers, and full-file requests. Per-mirror chunk counts describe assignments completed during the current application session; the total completed-chunk count is derived from the durable file state. Mirrors can be added or removed while a download is running.
 
 The settings dialog uses explicit white owner-drawn labels so text remains readable on dark Windows themes. The main queue uses native list-view painting for ordinary text cells and custom drawing only for the progress cell to avoid hover redraw flicker.
 
@@ -91,7 +91,7 @@ Automatic chunk sizing uses the file size and count of compatible range-capable 
 
 ## Speed and ETA calculation
 
-The main queue's **Speed** value is a short-interval network-throughput reading and can react quickly to bursts. **ETA** is intentionally steadier: it uses a rolling 8-second average of actual file progress, refreshed every 500 ms after a 2-second warm-up. Retransmitted bytes do not count as completed progress for ETA. The ETA averaging window is cleared on pause/resume so time spent paused is not included; the estimate becomes available again after enough post-resume samples have accumulated.
+The main queue's **Speed** value is a short-interval network-throughput reading and can react quickly to bursts. **ETA** uses the same stable average network throughput displayed as **Avg** in the file/mirror details window: total received bytes divided by elapsed time since the first response bytes arrived. The remaining file bytes are divided by that average to estimate the remaining time. This avoids a rolling-window warm-up that could make the ETA disappear periodically. Retransmitted bytes are included in the average, so repeated failed ranges can make the estimate optimistic; the average also naturally adjusts more slowly to sudden speed changes. ETA is hidden while a download is paused or has not received any data yet.
 
 ### Automatic output filenames
 

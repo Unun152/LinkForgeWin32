@@ -42,6 +42,10 @@ public:
         limit = std::clamp(value, 1, 64);
         condition.notify_all();
     }
+    int ActiveCount() {
+        std::lock_guard lock(mutex);
+        return active;
+    }
 private:
     std::mutex mutex;
     std::condition_variable condition;
@@ -954,6 +958,10 @@ DownloaderSettings GetSettings() {
     return g_settings;
 }
 
+int GetActiveConnectionCount() {
+    return g_transferLimiter.ActiveCount();
+}
+
 void SetSettings(const DownloaderSettings& settings) {
     DownloaderSettings normalized = settings;
     normalized.maxTotalConnections = std::clamp(normalized.maxTotalConnections, 1, 64);
@@ -1174,8 +1182,6 @@ void Download::Start() {
     keepPartialOnCancel.store(false);
     stopProbeRequests.store(false);
     speedBps = 0.0;
-    etaSpeedBps = 0.0;
-    etaSpeedSamples.clear();
     lastSpeedSampleBytes = networkBytes;
     speedSampleTick = 0;
     auto self = shared_from_this();
@@ -1207,8 +1213,6 @@ void Download::Pause() {
         phase = pauseSettled ? DownloadPhase::Paused : DownloadPhase::Pausing;
         statusText = pauseSettled ? L"Paused" : L"Pausing - flushing active ranges";
         speedBps = 0.0;
-        etaSpeedBps = 0.0;
-        etaSpeedSamples.clear();
         speedSampleTick = 0;
         lastSpeedSampleBytes = networkBytes;
     }
@@ -1235,8 +1239,6 @@ void Download::Resume() {
         pauseSettled = false;
         pauseCheckpointPending = false;
         pauseRequested.store(false);
-        etaSpeedSamples.clear();
-        etaSpeedBps = 0.0;
         speedBps = 0.0;
         speedSampleTick = 0;
         lastSpeedSampleBytes = networkBytes;
@@ -1350,8 +1352,6 @@ void Download::Retry() {
         completedBytes = fallbackBytes = networkBytes = 0;
         firstTransferTick = endTransferTick = 0;
         speedBps = 0;
-        etaSpeedBps = 0.0;
-        etaSpeedSamples.clear();
         lastSpeedSampleBytes = speedSampleTick = 0;
         completedSegments = 0;
         activeRequests = 0;
@@ -2244,7 +2244,6 @@ void Download::FinishCancelled() {
             statusText = userPaused ? L"Paused" : L"Queued to resume";
             terminal = false;
             speedBps = 0.0;
-            etaSpeedBps = 0.0;
         }
         cv.notify_all();
         return;

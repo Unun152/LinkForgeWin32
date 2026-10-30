@@ -34,8 +34,6 @@ constexpr wchar_t kTextDialogClass[] = L"LinkForgeTextDialog";
 constexpr wchar_t kDetailsClass[] = L"LinkForgeDetailsWindow";
 constexpr wchar_t kSettingsClass[] = L"LinkForgeSettingsWindow";
 constexpr UINT_PTR kUiTimer = 1;
-constexpr uint64_t kEtaAverageWindowMs = 25000;
-constexpr uint64_t kEtaMinimumWindowMs = 25000;
 
 constexpr int ID_ADD_DOWNLOAD = 1001;
 constexpr int ID_DETAILS = 1002;
@@ -793,14 +791,23 @@ uint64_t GetProgressBytesLocked(const Download& download) {
     return result;
 }
 
-std::wstring GetEtaLocked(const Download& download) {
+double GetAverageTransferSpeedLocked(const Download& download, uint64_t now) {
+    if (download.firstTransferTick == 0) return 0.0;
+    const uint64_t endTick = download.endTransferTick ? download.endTransferTick : now;
+    if (endTick <= download.firstTransferTick) return 0.0;
+    return static_cast<double>(download.networkBytes) * 1000.0 /
+           static_cast<double>(endTick - download.firstTransferTick);
+}
+
+std::wstring GetEtaLocked(const Download& download, uint64_t now) {
     if (download.phase == DownloadPhase::Completed || download.phase == DownloadPhase::Cancelled ||
         download.phase == DownloadPhase::CancelledKept || download.phase == DownloadPhase::Failed ||
-        download.phase == DownloadPhase::Paused || download.userPaused ||
-        !download.sizeKnown || download.etaSpeedBps < 1.0) return L"—";
+        download.phase == DownloadPhase::Paused || download.userPaused || !download.sizeKnown) return L"—";
+    const double averageSpeedBps = GetAverageTransferSpeedLocked(download, now);
+    if (averageSpeedBps < 1.0) return L"—";
     const uint64_t current = GetProgressBytesLocked(download);
     if (current >= download.totalSize) return L"—";
-    return FormatDuration(static_cast<double>(download.totalSize - current) / download.etaSpeedBps);
+    return FormatDuration(static_cast<double>(download.totalSize - current) / averageSpeedBps);
 }
 
 std::wstring GetSizeTextLocked(const Download& download) {
@@ -821,55 +828,27 @@ void SampleSpeeds() {
     for (const auto& download : g_downloads) {
         std::lock_guard lock(download->mutex);
         if (download->terminal && download->endTransferTick == 0) download->endTransferTick = now;
-        const bool pausedForEta = download->userPaused ||
+        const bool paused = download->userPaused ||
             download->phase == DownloadPhase::Pausing || download->phase == DownloadPhase::Paused;
 
-        if (pausedForEta) {
-            // Do not let time spent paused contaminate the next ETA sample window.
-            download->etaSpeedSamples.clear();
-            download->etaSpeedBps = 0.0;
+        if (paused) {
+            // Keep the short-interval Speed column from including time spent paused.
             download->speedBps = 0.0;
             download->speedSampleTick = 0;
         } else if (download->speedSampleTick == 0) {
             download->speedSampleTick = now;
             download->lastSpeedSampleBytes = download->networkBytes;
-            download->etaSpeedSamples.emplace_back(now, GetProgressBytesLocked(*download));
         } else if (now > download->speedSampleTick) {
             const uint64_t elapsed = now - download->speedSampleTick;
             if (elapsed >= 500) {
-                // Keep the Speed column responsive, but calculate ETA separately from
-                // actual progress so retransmitted bytes do not make the ETA optimistic.
                 const uint64_t networkDelta = download->networkBytes >= download->lastSpeedSampleBytes
                     ? download->networkBytes - download->lastSpeedSampleBytes : 0;
                 download->speedBps = static_cast<double>(networkDelta) * 1000.0 / static_cast<double>(elapsed);
                 download->lastSpeedSampleBytes = download->networkBytes;
                 download->speedSampleTick = now;
-
-                const uint64_t progressBytes = GetProgressBytesLocked(*download);
-                auto& history = download->etaSpeedSamples;
-                if (!history.empty() && progressBytes < history.back().second) {
-                    // A retry/recovery may legitimately reset progress. Start a fresh
-                    // averaging window rather than calculating a negative/invalid rate.
-                    history.clear();
-                }
-                history.emplace_back(now, progressBytes);
-                while (history.size() > 2 && now - history.front().first > kEtaAverageWindowMs)
-                    history.pop_front();
-
-                if (history.size() >= 2) {
-                    const uint64_t windowMs = history.back().first - history.front().first;
-                    const uint64_t progressDelta = history.back().second - history.front().second;
-                    if (windowMs >= kEtaMinimumWindowMs) {
-                        download->etaSpeedBps = static_cast<double>(progressDelta) * 1000.0 /
-                                                static_cast<double>(windowMs);
-                    } else {
-                        download->etaSpeedBps = 0.0;
-                    }
-                } else {
-                    download->etaSpeedBps = 0.0;
-                }
             }
         }
+
         for (const auto& mirror : download->mirrors) {
             if (mirror->speedSampleTick == 0) {
                 mirror->speedSampleTick = now;
@@ -919,6 +898,7 @@ bool SetListCell(HWND list, int row, int column, const std::wstring& text) {
 
 void UpdateMainList() {
     if (!g_mainList) return;
+    const uint64_t now = GetTickCount64();
     const int oldCount = ListView_GetItemCount(g_mainList);
     if (oldCount != static_cast<int>(g_downloads.size())) {
         const int selected = ListView_GetNextItem(g_mainList, -1, LVNI_SELECTED);
@@ -960,7 +940,7 @@ void UpdateMainList() {
         // list-view text every timer tick would invalidate it unnecessarily.
         SetListCell(g_mainList, row, 2, GetSizeTextLocked(*download));
         SetListCell(g_mainList, row, 3, FormatSpeed(download->speedBps));
-        SetListCell(g_mainList, row, 4, GetEtaLocked(*download));
+        SetListCell(g_mainList, row, 4, GetEtaLocked(*download, now));
         const std::wstring visibleStatus = download->userPaused
             ? (download->pauseSettled ? L"Paused" : L"Pausing - flushing active ranges")
             : download->statusText;
@@ -997,6 +977,7 @@ void UpdateMainList() {
         const std::wstring status = std::to_wstring(activeCount) + L" active   •   " +
                                     std::to_wstring(pausedCount) + L" paused   •   " +
                                     std::to_wstring(completedCount) + L" completed   •   " +
+                                    std::to_wstring(linkforge::GetActiveConnectionCount()) + L" connections   •   " +
                                     FormatSpeed(speed) + L" total";
         SetWindowTextW(g_statusText, status.c_str());
     }
@@ -1009,15 +990,12 @@ void RefreshDetails(DetailsContext* context) {
     std::wstring summary;
     bool terminal = false;
     bool canRetry = false;
-    uint64_t averageEndTick = 0;
     {
         std::lock_guard lock(download->mutex);
         mirrors = download->mirrors;
         const uint64_t now = GetTickCount64();
-        averageEndTick = download->endTransferTick ? download->endTransferTick : now;
-        const std::wstring average = download->firstTransferTick && averageEndTick > download->firstTransferTick
-            ? FormatSpeed(static_cast<double>(download->networkBytes) * 1000.0 / static_cast<double>(averageEndTick - download->firstTransferTick))
-            : L"—";
+        const double averageSpeedBps = GetAverageTransferSpeedLocked(*download, now);
+        const std::wstring average = averageSpeedBps >= 1.0 ? FormatSpeed(averageSpeedBps) : L"—";
         const size_t activeMirrors = static_cast<size_t>(std::count_if(download->mirrors.begin(), download->mirrors.end(),
             [](const auto& mirror) { return mirror->active; }));
         const size_t partialChunks = static_cast<size_t>(std::count_if(download->segments.begin(), download->segments.end(),
