@@ -1940,32 +1940,35 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
                 return 0;
             }
             const int confirm = MessageBoxW(hwnd,
-                L"Remove this entry and permanently delete its downloaded output and any partial/resume files?\n\nThis cannot be undone.",
-                L"Delete download and remove entry", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-            if (confirm != IDYES) return 0;
-            if (paused) download->RequestCancel(false);
+                L"Remove this download from the queue?\n\nYes: keep the downloaded output and any partial file(s).\nNo: delete the output and all partial/resume files.\nCancel: leave the entry and files unchanged.",
+                L"Remove download entry", MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON1);
+            if (confirm != IDYES && confirm != IDNO) return 0;
+            const bool keepFiles = confirm == IDYES;
+            if (paused) download->RequestCancel(keepFiles);
             download->Join();
-            std::wstring finalPath, partPath, partialPath;
-            {
-                std::lock_guard lock(download->mutex);
-                finalPath = download->finalPath;
-                partPath = download->partPath;
-                partialPath = download->partialPath;
-            }
-            std::vector<std::wstring> pathsToDelete = {
-                finalPath, partPath, partialPath,
-                finalPath + L".linkforge.part", finalPath + L".partial"
-            };
-            std::sort(pathsToDelete.begin(), pathsToDelete.end());
-            pathsToDelete.erase(std::unique(pathsToDelete.begin(), pathsToDelete.end()), pathsToDelete.end());
-            for (const std::wstring& path : pathsToDelete) {
-                DWORD deleteError = ERROR_SUCCESS;
-                if (!DeleteFileIfPresent(path, deleteError)) {
-                    const std::wstring errorText = L"Could not delete this download file:\n" + path +
-                        L"\n\nWindows error: " + std::to_wstring(deleteError) +
-                        L"\nClose any program using the file, then try Remove entry again.";
-                    MessageBoxW(hwnd, errorText.c_str(), L"Could not remove download", MB_OK | MB_ICONERROR);
-                    return 0;
+            if (!keepFiles) {
+                std::wstring finalPath, partPath, partialPath;
+                {
+                    std::lock_guard lock(download->mutex);
+                    finalPath = download->finalPath;
+                    partPath = download->partPath;
+                    partialPath = download->partialPath;
+                }
+                std::vector<std::wstring> pathsToDelete = {
+                    finalPath, partPath, partialPath,
+                    finalPath + L".linkforge.part", finalPath + L".partial"
+                };
+                std::sort(pathsToDelete.begin(), pathsToDelete.end());
+                pathsToDelete.erase(std::unique(pathsToDelete.begin(), pathsToDelete.end()), pathsToDelete.end());
+                for (const std::wstring& path : pathsToDelete) {
+                    DWORD deleteError = ERROR_SUCCESS;
+                    if (!DeleteFileIfPresent(path, deleteError)) {
+                        const std::wstring errorText = L"Could not delete this download file:\n" + path +
+                            L"\n\nWindows error: " + std::to_wstring(deleteError) +
+                            L"\nClose any program using the file, then try Remove entry again.";
+                        MessageBoxW(hwnd, errorText.c_str(), L"Could not remove download", MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
                 }
             }
 
@@ -1978,8 +1981,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (!PersistDownloadsToFile()) {
                 g_downloads.insert(g_downloads.begin() + std::min(index, static_cast<int>(g_downloads.size())), download);
                 g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
-                MessageBoxW(hwnd, L"The download files were deleted, but the queue INI could not be updated. The entry has been kept so you can retry removal.",
-                            L"Could not save download queue", MB_OK | MB_ICONERROR);
+                const std::wstring saveError = keepFiles
+                    ? L"The download files were kept, but the queue INI could not be updated. The entry has been kept so you can retry removal."
+                    : L"The download files were deleted, but the queue INI could not be updated. The entry has been kept so you can retry removal.";
+                MessageBoxW(hwnd, saveError.c_str(), L"Could not save download queue", MB_OK | MB_ICONERROR);
                 UpdateMainList();
                 return 0;
             }

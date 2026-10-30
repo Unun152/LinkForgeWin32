@@ -48,7 +48,7 @@ For parallel downloads, LinkForge can resume completed byte ranges after recheck
 
 A server that does not support byte-range requests cannot reliably resume a partially downloaded full-file response after the process has been closed. In that fallback mode, a reopened job must start the file again from byte zero. Pausing a fallback transfer flushes the data already received, and pause/resume during the same running session keeps its current connection. After an application restart, the fallback request must start over because the server offers no safe byte offset to request. A long pause can also cause an idle server connection to time out and be retried.
 
-Both INI files are kept beside the executable, not in AppData. The executable folder must be writable. If the queue is empty, `LinkForgeDownloads.ini` is removed. **Remove entry** deletes the final output, temporary partial file(s), and the queue record; it reports a Windows file-deletion error rather than silently dropping the record if a file is locked.
+Both INI files are kept beside the executable, not in AppData. The executable folder must be writable. If the queue is empty, `LinkForgeDownloads.ini` is removed. **Remove entry** lets you choose to keep the downloaded output and any partial file(s), delete the output and all partial/resume files, or cancel removal. The queue record is removed either way; when keeping files, the output/partial data remain on disk without a queue entry. When deleting, LinkForge reports a Windows file-deletion error rather than silently dropping the record if a file is locked.
 
 ## Settings
 
