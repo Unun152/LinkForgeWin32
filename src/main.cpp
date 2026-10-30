@@ -34,8 +34,8 @@ constexpr wchar_t kTextDialogClass[] = L"LinkForgeTextDialog";
 constexpr wchar_t kDetailsClass[] = L"LinkForgeDetailsWindow";
 constexpr wchar_t kSettingsClass[] = L"LinkForgeSettingsWindow";
 constexpr UINT_PTR kUiTimer = 1;
-constexpr uint64_t kEtaAverageWindowMs = 8000;
-constexpr uint64_t kEtaMinimumWindowMs = 2000;
+constexpr uint64_t kEtaAverageWindowMs = 25000;
+constexpr uint64_t kEtaMinimumWindowMs = 25000;
 
 constexpr int ID_ADD_DOWNLOAD = 1001;
 constexpr int ID_DETAILS = 1002;
