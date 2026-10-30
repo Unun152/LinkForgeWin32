@@ -43,6 +43,7 @@ constexpr int ID_RETRY = 1005;
 constexpr int ID_OPEN_FOLDER = 1006;
 constexpr int ID_SETTINGS = 1007;
 constexpr int ID_PAUSE = 1008;
+constexpr int ID_CLEAR_COMPLETED = 1009;
 
 constexpr int ID_DIALOG_URLS = 2001;
 constexpr int ID_DIALOG_FOLDER = 2002;
@@ -87,6 +88,7 @@ HWND g_mainWindow = nullptr;
 HWND g_mainList = nullptr;
 HWND g_statusText = nullptr;
 HWND g_pauseButton = nullptr;
+HWND g_clearCompletedButton = nullptr;
 std::wstring g_configPath;
 std::wstring g_downloadsStatePath;
 std::wstring g_lastSaveFolder;
@@ -1831,7 +1833,12 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         AddColumn(g_mainList, 3, L"Speed", 105);
         AddColumn(g_mainList, 4, L"ETA (avg)", 95);
         AddColumn(g_mainList, 5, L"Status", 210);
-        g_statusText = CreateLabel(hwnd, L"Ready", 22, 608, 1050, 22);
+        g_statusText = CreateLabel(hwnd, L"Ready", 22, 608, 900, 22);
+        g_clearCompletedButton = CreateDarkButton(hwnd, L"Clear completed", ID_CLEAR_COMPLETED, 0, 0, 120, 30);
+        RECT initialClient{};
+        GetClientRect(hwnd, &initialClient);
+        MoveWindow(g_statusText, 22, initialClient.bottom - 32, initialClient.right - 182, 22, TRUE);
+        MoveWindow(g_clearCompletedButton, initialClient.right - 142, initialClient.bottom - 38, 120, 30, TRUE);
         SetTimer(hwnd, kUiTimer, 500, nullptr);
         return 0;
     }
@@ -1848,7 +1855,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         const int width = client.right - client.left;
         const int height = client.bottom - client.top;
         MoveWindow(g_mainList, 20, 70, width - 40, height - 118, TRUE);
-        MoveWindow(g_statusText, 22, height - 32, width - 44, 22, TRUE);
+        MoveWindow(g_statusText, 22, height - 32, width - 182, 22, TRUE);
+        MoveWindow(g_clearCompletedButton, width - 142, height - 38, 120, 30, TRUE);
         break;
     }
     case WM_TIMER: {
@@ -1929,9 +1937,11 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             auto download = g_downloads[static_cast<size_t>(index)];
             bool terminal = false;
             bool paused = false;
+            bool completed = false;
             {
                 std::lock_guard lock(download->mutex);
                 terminal = download->terminal;
+                completed = download->phase == DownloadPhase::Completed;
                 paused = download->userPaused || download->pauseRequested.load() || download->phase == DownloadPhase::Paused;
             }
             if (!terminal && !paused) {
@@ -1939,14 +1949,20 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
                             L"Download is active", MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
-            const int confirm = MessageBoxW(hwnd,
-                L"Remove this download from the queue?\n\nYes: keep the downloaded output and any partial file(s).\nNo: delete the output and all partial/resume files.\nCancel: leave the entry and files unchanged.",
-                L"Remove download entry", MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON1);
-            if (confirm != IDYES && confirm != IDNO) return 0;
-            const bool keepFiles = confirm == IDYES;
+
+            // A completed download is only removed from the queue; its finished file is always kept.
+            bool deleteFiles = false;
+            if (!completed) {
+                const int confirm = MessageBoxW(hwnd,
+                    L"This download is incomplete. Remove its queue entry?\n\nYes: delete its partial/output files and resume data.\nNo: keep its partial/output files.\nCancel: leave the entry and files unchanged.",
+                    L"Remove incomplete download", MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
+                if (confirm != IDYES && confirm != IDNO) return 0;
+                deleteFiles = confirm == IDYES;
+            }
+            const bool keepFiles = !deleteFiles;
             if (paused) download->RequestCancel(keepFiles);
             download->Join();
-            if (!keepFiles) {
+            if (deleteFiles) {
                 std::wstring finalPath, partPath, partialPath;
                 {
                     std::lock_guard lock(download->mutex);
@@ -1981,12 +1997,57 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (!PersistDownloadsToFile()) {
                 g_downloads.insert(g_downloads.begin() + std::min(index, static_cast<int>(g_downloads.size())), download);
                 g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
-                const std::wstring saveError = keepFiles
-                    ? L"The download files were kept, but the queue INI could not be updated. The entry has been kept so you can retry removal."
-                    : L"The download files were deleted, but the queue INI could not be updated. The entry has been kept so you can retry removal.";
+                const std::wstring saveError = deleteFiles
+                    ? L"The download files were deleted, but the queue INI could not be updated. The entry has been kept so you can retry removal."
+                    : L"The download files were kept, but the queue INI could not be updated. The entry has been kept so you can retry removal.";
                 MessageBoxW(hwnd, saveError.c_str(), L"Could not save download queue", MB_OK | MB_ICONERROR);
                 UpdateMainList();
                 return 0;
+            }
+            for (HWND detailWindow : detailWindowsToClose) DestroyWindow(detailWindow);
+            g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
+            UpdateMainList();
+            return 0;
+        }
+        case ID_CLEAR_COMPLETED: {
+            const std::vector<std::shared_ptr<Download>> previousDownloads = g_downloads;
+            std::vector<std::shared_ptr<Download>> completedDownloads;
+            for (const auto& download : g_downloads) {
+                bool completed = false;
+                {
+                    std::lock_guard lock(download->mutex);
+                    completed = download->phase == DownloadPhase::Completed;
+                }
+                if (completed) completedDownloads.push_back(download);
+            }
+            if (completedDownloads.empty()) {
+                if (g_statusText) SetWindowTextW(g_statusText, L"No completed entries to clear");
+                return 0;
+            }
+
+            // Completed jobs no longer write to disk; join their manager threads before
+            // dropping the queue references. Their finished output files are untouched.
+            for (const auto& download : completedDownloads) download->Join();
+            g_downloads.erase(std::remove_if(g_downloads.begin(), g_downloads.end(),
+                [&](const std::shared_ptr<Download>& download) {
+                    return std::find(completedDownloads.begin(), completedDownloads.end(), download) != completedDownloads.end();
+                }), g_downloads.end());
+
+            if (!PersistDownloadsToFile()) {
+                g_downloads = previousDownloads;
+                g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
+                MessageBoxW(hwnd, L"Could not update the download queue file. Completed entries have been restored in the list; no downloaded files were changed.",
+                            L"Could not clear completed entries", MB_OK | MB_ICONERROR);
+                UpdateMainList();
+                return 0;
+            }
+
+            std::vector<HWND> detailWindowsToClose;
+            for (HWND detailWindow : g_detailWindows) {
+                auto* detailContext = reinterpret_cast<DetailsContext*>(GetWindowLongPtrW(detailWindow, GWLP_USERDATA));
+                if (detailContext &&
+                    std::find(completedDownloads.begin(), completedDownloads.end(), detailContext->download) != completedDownloads.end())
+                    detailWindowsToClose.push_back(detailWindow);
             }
             for (HWND detailWindow : detailWindowsToClose) DestroyWindow(detailWindow);
             g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
