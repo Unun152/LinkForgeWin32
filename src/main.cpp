@@ -1025,17 +1025,24 @@ void RefreshDetails(DetailsContext* context) {
         const uint64_t chunkBytes = download->persistentSegmentBytes ? download->persistentSegmentBytes : download->restoredSegmentBytes;
         const std::wstring chunkSizeText = chunkBytes ? FormatBytes(chunkBytes) : L"not set";
         std::wstring shortStatus = download->statusText;
-        if (shortStatus.size() > 30) shortStatus = shortStatus.substr(0, 27) + L"...";
+        // Normal transfer-state text repeats the selected mode shown on the first row.
+        if (shortStatus == L"Downloading with parallel byte ranges" ||
+            shortStatus == L"Downloading from one mirror at a time" ||
+            shortStatus == L"Downloading from mirror") {
+            shortStatus.clear();
+        } else if (shortStatus.size() > 30) {
+            shortStatus = shortStatus.substr(0, 27) + L"...";
+        }
         const std::wstring summaryFirstRow =
             L"Mirrors: " + std::to_wstring(activeMirrors) + L"/" + std::to_wstring(download->mirrors.size()) + L" active" +
-            L"   ·   " + (download->singleMirrorOnly ? L"Single mirror" : L"Parallel mirrors") +
+            L"   ·   " + (download->singleMirrorOnly ? L"Mode: Single mirror" : L"Mode: Parallel") +
             L"   ·   Chunk: " + chunkSizeText +
             L"   ·   Chunks: " + std::to_wstring(download->completedSegments) + L"/" + std::to_wstring(download->segments.size()) + L" complete";
         const std::wstring summarySecondRow =
             L"Active: " + std::to_wstring(download->activeRequests) + L"   ·   Partial: " + std::to_wstring(partialChunks) +
             L"   ·   Progress: " + GetProgressTextLocked(*download) + L" (" + GetSizeTextLocked(*download) + L")" +
             L"   ·   Current: " + FormatSpeed(download->speedBps) + L"   ·   Avg: " + average +
-            L"   ·   " + shortStatus;
+            (shortStatus.empty() ? std::wstring() : L"   ·   Status: " + shortStatus);
         summary = summaryFirstRow + L"\r\n" + summarySecondRow;
         terminal = download->terminal;
         canRetry = download->phase == DownloadPhase::Failed || download->phase == DownloadPhase::Cancelled ||
@@ -1824,25 +1831,18 @@ void ShutdownDownloadJobs() {
 LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
-        CreateLabel(hwnd, L"LinkForge", 20, 12, 250, 32);
-        // The title static uses a larger font through WM_DRAWITEM-free direct font assignment.
-        HWND subtitle = CreateLabel(hwnd, L"Multi-mirror downloads · native Windows C++", 22, 42, 420, 22);
-        SetWindowTextW(subtitle, L"Multi-mirror downloads  |  native Windows C++");
-        HWND title = FindWindowExW(hwnd, nullptr, L"STATIC", L"LinkForge");
-        if (title && g_fontTitle) SetFont(title, g_fontTitle);
-
-        CreateDarkButton(hwnd, L"＋ Add new file download", ID_ADD_DOWNLOAD, 20, 74, 190, 38);
-        CreateDarkButton(hwnd, L"File details / mirrors", ID_DETAILS, 220, 74, 155, 38);
-        g_pauseButton = CreateDarkButton(hwnd, L"Pause", ID_PAUSE, 385, 74, 92, 38);
-        CreateDarkButton(hwnd, L"Cancel", ID_CANCEL, 487, 74, 95, 38);
-        CreateDarkButton(hwnd, L"Retry", ID_RETRY, 592, 74, 72, 38);
-        CreateDarkButton(hwnd, L"Remove entry", ID_REMOVE, 674, 74, 112, 38);
-        CreateDarkButton(hwnd, L"Open folder", ID_OPEN_FOLDER, 796, 74, 108, 38);
-        CreateDarkButton(hwnd, L"Settings", ID_SETTINGS, 914, 74, 100, 38);
+        CreateDarkButton(hwnd, L"＋ Add new file download", ID_ADD_DOWNLOAD, 20, 18, 190, 38);
+        CreateDarkButton(hwnd, L"File details / mirrors", ID_DETAILS, 220, 18, 155, 38);
+        g_pauseButton = CreateDarkButton(hwnd, L"Pause", ID_PAUSE, 385, 18, 92, 38);
+        CreateDarkButton(hwnd, L"Cancel", ID_CANCEL, 487, 18, 95, 38);
+        CreateDarkButton(hwnd, L"Retry", ID_RETRY, 592, 18, 72, 38);
+        CreateDarkButton(hwnd, L"Remove entry", ID_REMOVE, 674, 18, 112, 38);
+        CreateDarkButton(hwnd, L"Open folder", ID_OPEN_FOLDER, 796, 18, 108, 38);
+        CreateDarkButton(hwnd, L"Settings", ID_SETTINGS, 914, 18, 100, 38);
 
         g_mainList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                                      WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                                     20, 126, 1080, 470, hwnd, nullptr, g_instance, nullptr);
+                                     20, 70, 1080, 510, hwnd, nullptr, g_instance, nullptr);
         SetFont(g_mainList);
         ConfigureListView(g_mainList);
         AddColumn(g_mainList, 0, L"File", 245);
@@ -1867,7 +1867,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         GetClientRect(hwnd, &client);
         const int width = client.right - client.left;
         const int height = client.bottom - client.top;
-        MoveWindow(g_mainList, 20, 126, width - 40, height - 174, TRUE);
+        MoveWindow(g_mainList, 20, 70, width - 40, height - 118, TRUE);
         MoveWindow(g_statusText, 22, height - 32, width - 44, 22, TRUE);
         break;
     }
