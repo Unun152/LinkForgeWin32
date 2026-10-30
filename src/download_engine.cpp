@@ -124,6 +124,7 @@ struct RangeResult {
     bool ok = false;
     bool paused = false;
     bool bytesFlushed = false;
+    bool retryableTransportError = false; // A request/read failed after the server response; retry even if HTTP status was 206.
     unsigned int httpStatus = 0;
     unsigned int retryAfterSeconds = 0;
     bool protocolMismatch = false;
@@ -694,20 +695,30 @@ RangeResult DownloadRange(Download& download, const std::shared_ptr<Mirror>& mir
         const DWORD maxRead = static_cast<DWORD>(std::min<uint64_t>(buffer.size(), end - position + 1));
         DWORD available = 0;
         if (!WinHttpQueryDataAvailable(response->request, &available)) {
-            result.error = L"Network read failed: " + std::to_wstring(GetLastError());
+            const DWORD errorCode = GetLastError();
+            if (download.pauseRequested.load()) result.paused = true;
+            else if (!download.cancelRequested.load()) result.retryableTransportError = true;
+            result.error = L"Network read failed: " + std::to_wstring(errorCode);
             break;
         }
         if (available == 0) {
+            // A short response is a transient transfer interruption, not proof
+            // that the mirror does not support byte ranges.
+            result.retryableTransportError = true;
             result.error = L"Server ended the range early";
             break;
         }
         const DWORD want = std::min(maxRead, available);
         DWORD got = 0;
         if (!WinHttpReadData(response->request, buffer.data(), want, &got)) {
-            result.error = L"Network read failed: " + std::to_wstring(GetLastError());
+            const DWORD errorCode = GetLastError();
+            if (download.pauseRequested.load()) result.paused = true;
+            else if (!download.cancelRequested.load()) result.retryableTransportError = true;
+            result.error = L"Network read failed: " + std::to_wstring(errorCode);
             break;
         }
         if (got == 0) {
+            result.retryableTransportError = true;
             result.error = L"Server ended the range early";
             break;
         }
@@ -2017,7 +2028,11 @@ void Download::RunParallel() {
                     ++chosenMirror->failures;
                     chosenMirror->lastError = transfer.error;
                     const DownloaderSettings settings = GetSettings();
-                    const bool retryable = IsRetryableStatus(transfer.httpStatus) &&
+                    // A 206 response only confirms the range request was accepted.
+                    // WinHTTP can still lose the connection while reading its body.
+                    // Retry those transport failures instead of permanently excluding
+                    // the mirror as though its byte-range protocol were unsupported.
+                    const bool retryable = (transfer.retryableTransportError || IsRetryableStatus(transfer.httpStatus)) &&
                                            CanRetry(settings, static_cast<unsigned int>(chosenMirror->failures - 1));
                     if (retryable) {
                         const unsigned int retryDelay = transfer.retryAfterSeconds > 0

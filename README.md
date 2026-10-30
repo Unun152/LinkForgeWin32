@@ -70,7 +70,7 @@ The global connection setting is an application-wide limit and can be configured
 
 The connection ramp-up is per mirror: LinkForge initially sends at most one active range request to a mirror. After successful range transfers, it can gradually increase that mirror's concurrency up to the configured limit. Other mirrors can each start with their own first request. When adaptive throttling is enabled, a 509/429 response lowers that mirror's own connection cap by one (not below one); three subsequent successful range transfers increase the cap by one until it reaches the configured maximum.
 
-HTTP 509 is treated as temporary server-side throttling, not as proof that byte ranges are unsupported. LinkForge respects a server's `Retry-After` header when present; otherwise it uses the configured retry delay. Other mirrors continue while one mirror waits.
+HTTP 509 is treated as temporary server-side throttling, not as proof that byte ranges are unsupported. LinkForge respects a server's `Retry-After` header when present; otherwise it uses the configured retry delay. Connection drops and incomplete response bodies during a range read are also retried even when the server initially returned HTTP 206; they do not permanently disable that mirror's range support. Other mirrors continue while one mirror waits.
 
 ## Cancel and remove
 
