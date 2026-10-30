@@ -39,7 +39,7 @@ public:
     }
     void SetLimit(int value) {
         std::lock_guard lock(mutex);
-        limit = std::clamp(value, 1, 64);
+        limit = std::clamp(value, 1, 1024);
         condition.notify_all();
     }
     int ActiveCount() {
@@ -964,7 +964,7 @@ int GetActiveConnectionCount() {
 
 void SetSettings(const DownloaderSettings& settings) {
     DownloaderSettings normalized = settings;
-    normalized.maxTotalConnections = std::clamp(normalized.maxTotalConnections, 1, 64);
+    normalized.maxTotalConnections = std::clamp(normalized.maxTotalConnections, 1, 1024);
     normalized.maxConnectionsPerMirror = std::clamp(normalized.maxConnectionsPerMirror, 1, 32);
     normalized.rampUpDelayMs = std::clamp(normalized.rampUpDelayMs, 0u, 60000u);
     normalized.retryDelaySeconds = std::clamp(normalized.retryDelaySeconds, 1u, 3600u);
@@ -988,6 +988,7 @@ bool InitializeHttp() {
                                 WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!g_httpSession) return false;
+    // This per-server WinHTTP cap is intentionally independent of LinkForge's 1024 global request limit.
     DWORD maxConnectionsPerServer = 64;
     WinHttpSetOption(g_httpSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER,
                      &maxConnectionsPerServer, sizeof(maxConnectionsPerServer));

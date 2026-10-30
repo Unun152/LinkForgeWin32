@@ -56,7 +56,7 @@ Click **Settings** in the main window. Every setting has a tooltip explaining it
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| Maximum simultaneous connections across all downloads | 8 | Application safety cap for active requests across the queue; hard maximum 64 |
+| Maximum simultaneous connections across all downloads | 8 | Application-wide active HTTP request limit across the queue; maximum 1024. WinHTTP remains capped at 64 connections per individual server. |
 | Maximum parallel connections to each mirror | 2 | Per-URL concurrent range-request limit |
 | Gradual connection ramp-up | On | Starts each mirror with one range request and permits more after successful transfers |
 | Ramp-up delay | 500 ms | Minimum wait before adding another concurrent request to a mirror |
@@ -66,7 +66,7 @@ Click **Settings** in the main window. Every setting has a tooltip explaining it
 | Custom User-Agent header | On | Sends the text in the User-Agent field with each HTTP request |
 | Chunk size (MB) | 0 (automatic) | 0 calculates `targetChunks = max(8, compatibleMirrors × 4)`, then `ceil(fileSize / targetChunks)`, clamped to 64 KiB–4 MiB; 1–64 uses a fixed chunk size in MiB |
 
-The global connection setting is deliberately capped at 64 as an application safety limit, not because Windows imposes a 64-connection limit across the whole application. LinkForge uses the cap to bound simultaneous requests and resource use. Separately, the WinHTTP session is configured for up to 64 connections per individual server; increasing the global cap beyond 64 would require changing the application policy and would not raise that per-server setting. A value of 64 is an upper safety bound, not a recommended default.
+The global connection setting is an application-wide limit and can be configured from 1 to 1024 active HTTP requests across all downloads. This is not a Windows-wide 64-connection limit. The WinHTTP session remains separately configured for up to 64 connections to any individual server; raising the LinkForge global limit does not change that per-server cap. Each mirror is also governed by the configured per-mirror limit (1–32). Large global values can create many worker threads and consume substantial CPU, memory, socket, and bandwidth resources, while remote hosts may throttle or reject excessive concurrency. The default remains 8; increase the setting gradually and only when your workload benefits from it.
 
 The connection ramp-up is per mirror: LinkForge initially sends at most one active range request to a mirror. After successful range transfers, it can gradually increase that mirror's concurrency up to the configured limit. Other mirrors can each start with their own first request. When adaptive throttling is enabled, a 509/429 response lowers that mirror's own connection cap by one (not below one); three subsequent successful range transfers increase the cap by one until it reaches the configured maximum.
 

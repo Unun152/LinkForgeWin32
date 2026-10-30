@@ -203,7 +203,7 @@ void LoadSettingsFromFile(linkforge::DownloaderSettings& settings) {
     GetPrivateProfileStringW(L"HTTP", L"UserAgent", settings.userAgent.c_str(), userAgent,
                               static_cast<DWORD>(std::size(userAgent)), g_configPath.c_str());
     settings.userAgent = userAgent;
-    settings.maxTotalConnections = std::clamp(settings.maxTotalConnections, 1, 64);
+    settings.maxTotalConnections = std::clamp(settings.maxTotalConnections, 1, 1024);
     settings.maxConnectionsPerMirror = std::clamp(settings.maxConnectionsPerMirror, 1, 32);
     settings.rampUpDelayMs = std::clamp(settings.rampUpDelayMs, 0u, 60000u);
     settings.retryDelaySeconds = std::clamp(settings.retryDelaySeconds, 1u, 3600u);
@@ -1582,7 +1582,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         CreateSettingsLabel(hwnd, L"Download settings", 24, 18, 500, 32);
         CreateSettingsLabel(hwnd, L"These settings are saved to LinkForge.ini beside the executable.", 26, 50, 680, 22);
         CreateSettingsLabel(hwnd, L"CONNECTION LIMITS", 26, 86, 300, 20);
-        CreateSettingsLabel(hwnd, L"Maximum simultaneous connections across all downloads", 28, 116, 500, 24);
+        CreateSettingsLabel(hwnd, L"Maximum simultaneous connections across all downloads (max 1024)", 28, 116, 550, 24);
         context->maxTotalEdit = CreateEdit(hwnd, ID_SETTINGS_MAX_TOTAL, 590, 111, 110, 28, ES_NUMBER);
         SetWindowTextW(context->maxTotalEdit, std::to_wstring(context->settings.maxTotalConnections).c_str());
         CreateSettingsLabel(hwnd, L"Maximum parallel connections to each mirror", 28, 153, 500, 24);
@@ -1625,7 +1625,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         SendMessageW(context->tooltip, TTM_SETMAXTIPWIDTH, 0, 360);
         SendMessageW(context->tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 350);
         AddControlTooltip(context->tooltip, hwnd, context->maxTotalEdit,
-            L"Application safety limit: at most 64 active data requests across all downloads. This is not a Windows-wide limit; LinkForge uses it to prevent excessive worker and socket use. WinHTTP is separately configured for up to 64 connections per server, so values above 64 would not increase the per-server limit. Increase this only when downloading from many different servers and your system/network can handle the extra load.");
+            L"Application-wide limit: up to 1024 active HTTP requests across all downloads. This is LinkForge's global scheduler cap, not a Windows-wide limit. WinHTTP remains separately configured for up to 64 connections to any one server; increasing this value does not raise that per-server limit. Each mirror is also subject to the 'Maximum parallel connections to each mirror' setting (1-32). High values can create many worker threads and consume CPU, memory, sockets, and bandwidth; servers or networks may throttle or reject excessive concurrency. Increase gradually and only as needed.");
         AddControlTooltip(context->tooltip, hwnd, context->maxPerMirrorEdit,
             L"Maximum simultaneous byte-range requests sent to one mirror. The global connection limit still applies. For HTTP 509 or 429 responses, start low (1 or 2).");
         AddControlTooltip(context->tooltip, hwnd, context->rampUpCheck,
@@ -1667,7 +1667,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         }
         if (id == ID_SETTINGS_SAVE) {
             unsigned long value = 0;
-            if (!ReadUnsignedSetting(context->maxTotalEdit, L"Maximum simultaneous connections", 1, 64, value)) return 0;
+            if (!ReadUnsignedSetting(context->maxTotalEdit, L"Maximum simultaneous connections", 1, 1024, value)) return 0;
             context->settings.maxTotalConnections = static_cast<int>(value);
             if (!ReadUnsignedSetting(context->maxPerMirrorEdit, L"Maximum connections per mirror", 1, 32, value)) return 0;
             context->settings.maxConnectionsPerMirror = static_cast<int>(value);
