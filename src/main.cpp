@@ -990,10 +990,12 @@ void RefreshDetails(DetailsContext* context) {
     std::wstring summary;
     bool terminal = false;
     bool canRetry = false;
+    uint64_t averageEndTick = 0;
     {
         std::lock_guard lock(download->mutex);
         mirrors = download->mirrors;
         const uint64_t now = GetTickCount64();
+        averageEndTick = download->endTransferTick ? download->endTransferTick : now;
         const double averageSpeedBps = GetAverageTransferSpeedLocked(*download, now);
         const std::wstring average = averageSpeedBps >= 1.0 ? FormatSpeed(averageSpeedBps) : L"—";
         const size_t activeMirrors = static_cast<size_t>(std::count_if(download->mirrors.begin(), download->mirrors.end(),
