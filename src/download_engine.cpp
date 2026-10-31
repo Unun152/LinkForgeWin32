@@ -2765,6 +2765,7 @@ void Download::ClearResumeDataLocked() {
     restoredPartialSegmentBytes.clear();
     segments.clear();
     completedSegments = 0;
+    activeRequests = 0;
 
     sizeKnown = false;
     totalSize = 0;
@@ -2816,7 +2817,8 @@ void Download::FinishCancelled() {
         bool alreadyPreserved = false;
         {
             std::lock_guard lock(mutex);
-            alreadyPreserved = partialKept && !partialPath.empty() && partPath == partialPath;
+            alreadyPreserved = !partialPath.empty() && partPath == partialPath &&
+                partPath.size() >= 8 && partPath.compare(partPath.size() - 8, 8, L".partial") == 0;
         }
         if (!alreadyPreserved) PreservePartialFile();
 
@@ -2831,7 +2833,8 @@ void Download::FinishCancelled() {
             bool renamed = false;
             {
                 std::lock_guard lock(mutex);
-                renamed = partialKept && !partialPath.empty() && partPath == partialPath;
+                renamed = !partialPath.empty() && partPath == partialPath &&
+                    partPath.size() >= 8 && partPath.compare(partPath.size() - 8, 8, L".partial") == 0;
                 keptPath = partPath;
                 if (renamed) {
                     partialPath = partPath;
