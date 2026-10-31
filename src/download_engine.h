@@ -121,7 +121,7 @@ struct DownloadResumeState {
     uint64_t referenceMiddleHash = 0;
     uint64_t referenceSuffixHash = 0;
     std::vector<uint64_t> completedSegmentIndices;
-    std::vector<std::pair<uint64_t, uint64_t>> partialSegmentBytes; // segment index -> durable bytes in that segment
+    std::vector<std::pair<uint64_t, uint64_t>> partialSegmentBytes; // flushed in-progress bytes within each segment; not a recovery-file path
     bool singleMirrorOnly = false;
     bool wasCompleted = false;
     bool wasFailed = false;
@@ -211,7 +211,7 @@ public:
     uint64_t referenceMiddleHash = 0;
     uint64_t referenceSuffixHash = 0;
     std::vector<uint64_t> restoredCompletedSegmentIndices;
-    std::vector<std::pair<uint64_t, uint64_t>> restoredPartialSegmentBytes;
+    std::vector<std::pair<uint64_t, uint64_t>> restoredPartialSegmentBytes; // restored in-progress chunk offsets
     bool initialProbeComplete = false;
     bool referenceReady = false;
     bool referenceSizeKnown = false;

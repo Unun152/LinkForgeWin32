@@ -493,7 +493,9 @@ void LoadDownloadsFromFile() {
                 auto indices = ParseIndexList(chunk);
                 resume.completedSegmentIndices.insert(resume.completedSegmentIndices.end(), indices.begin(), indices.end());
             }
-            const int partialChunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"PartialChunkCount", 0,
+            // PartialChunkCount/PartialChunkN are durable byte offsets inside active
+        // parallel segments. They are not .partial recovery-file paths.
+        const int partialChunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"PartialChunkCount", 0,
                                                                                               g_downloadsStatePath.c_str())), 0, 10000);
             for (int c = 0; c < partialChunkCount; ++c) {
                 const auto chunk = ReadStateString(section.c_str(), L"PartialChunk" + std::to_wstring(c), g_downloadsStatePath);
