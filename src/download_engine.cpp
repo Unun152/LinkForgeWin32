@@ -1241,11 +1241,23 @@ Download::Download(const std::wstring& folder, const std::wstring& name,
 
         singleMirrorOnly = resume->singleMirrorOnly;
 
-        // An explicit cancellation is never a resumable checkpoint. This also
-        // handles legacy CancelledKept queue records without opening their old
-        // .partial paths or restoring the associated chunk map.
+        // A persisted Cancelled state is not sufficient proof that the user's
+        // file handoff/deletion completed (older versions saved intent before
+        // waiting for the worker). Keep any legacy chunk map until Retry asks
+        // what to do with it. Never restore or inspect a legacy .partial path.
+        sizeKnown = resume->sizeKnown;
+        totalSize = resume->totalSize;
+        persistentSegmentBytes = resume->segmentBytes;
+        restoredTotalSize = resume->totalSize;
+        restoredSegmentBytes = resume->segmentBytes;
+        restoredReferencePrefixHash = resume->referencePrefixHash;
+        restoredReferenceMiddleHash = resume->referenceMiddleHash;
+        restoredReferenceSuffixHash = resume->referenceSuffixHash;
+        restoredCompletedSegmentIndices = resume->completedSegmentIndices;
+        restoredPartialSegmentBytes = resume->partialSegmentBytes;
+        restorePending = resume->segmentBytes > 0 && resume->totalSize > 0;
+
         if (resume->wasCancelled || resume->wasCancelledKept) {
-            ClearResumeDataLocked();
             if (resume->wasCancelledKept) {
                 phase = DownloadPhase::CancelledKept;
                 statusText = L"Cancelled - recovery file handed to the user (restored)";
@@ -1254,41 +1266,27 @@ Download::Download(const std::wstring& folder, const std::wstring& name,
                 statusText = L"Cancelled (restored)";
             }
             terminal = true;
+        } else if (resume->wasCompleted) {
+            phase = DownloadPhase::Completed;
+            statusText = L"Completed (restored)";
+            terminal = true;
+            completedBytes = totalSize;
+        } else if (resume->wasFailed) {
+            phase = DownloadPhase::Failed;
+            statusText = L"Failed (restored)";
+            terminal = true;
+        } else if (resume->wasPaused) {
+            phase = DownloadPhase::Paused;
+            statusText = L"Paused";
+            userPaused = true;
+            pauseSettled = true; // A persisted pause is already a completed checkpoint.
+            pauseCheckpointPending = false;
+            pauseRequested.store(true);
+            terminal = false;
         } else {
-            sizeKnown = resume->sizeKnown;
-            totalSize = resume->totalSize;
-            persistentSegmentBytes = resume->segmentBytes;
-            restoredTotalSize = resume->totalSize;
-            restoredSegmentBytes = resume->segmentBytes;
-            restoredReferencePrefixHash = resume->referencePrefixHash;
-            restoredReferenceMiddleHash = resume->referenceMiddleHash;
-            restoredReferenceSuffixHash = resume->referenceSuffixHash;
-            restoredCompletedSegmentIndices = resume->completedSegmentIndices;
-            restoredPartialSegmentBytes = resume->partialSegmentBytes;
-            restorePending = resume->segmentBytes > 0 && resume->totalSize > 0;
-
-            if (resume->wasCompleted) {
-                phase = DownloadPhase::Completed;
-                statusText = L"Completed (restored)";
-                terminal = true;
-                completedBytes = totalSize;
-            } else if (resume->wasFailed) {
-                phase = DownloadPhase::Failed;
-                statusText = L"Failed (restored)";
-                terminal = true;
-            } else if (resume->wasPaused) {
-                phase = DownloadPhase::Paused;
-                statusText = L"Paused";
-                userPaused = true;
-                pauseSettled = true; // A persisted pause is already a completed checkpoint.
-                pauseCheckpointPending = false;
-                pauseRequested.store(true);
-                terminal = false;
-            } else {
-                phase = DownloadPhase::Queued;
-                statusText = L"Queued to resume";
-                terminal = false;
-            }
+            phase = DownloadPhase::Queued;
+            statusText = L"Queued to resume";
+            terminal = false;
         }
     } else {
         fileName = UniqueName(outputFolder, fileName);
@@ -1527,19 +1525,22 @@ RetryResult Download::Retry(WorkingFileAction action, std::wstring& message) {
     }
 
     const bool hasSavedMapLayout = mapSegmentBytes > 0 && mapTotalSize > 0;
-    const bool canResumeSavedMap = hasSavedMapLayout && partExists && partFileSize == mapTotalSize;
+    const bool canResumeSavedMap = hasSavedMapLayout && !restoredMapInvalid &&
+                                   partExists && partFileSize == mapTotalSize;
     const bool hasWorkingFileData = partExists && partFileSize > 0;
 
-    // A matching parallel map can safely resume the .linkforge.part file. Every
-    // other restart that would replace a non-empty working file requires an
-    // explicit Keep/Delete decision. Missing or empty files contain no data to
-    // hand off or delete, so stale map metadata can simply be discarded.
-    const bool needsFileDecision = !canResumeSavedMap && hasWorkingFileData;
+    // A saved checkpoint is never disposable merely because the working file is
+    // missing, empty, or has an unexpected size. In every such case, require an
+    // explicit Keep/Delete decision before abandoning either the file or its map.
+    const bool hasSavedChunkMetadata = HasSavedChunkMetadataLocked();
+    const bool needsFileDecision = !canResumeSavedMap &&
+        (hasWorkingFileData || hasSavedChunkMetadata);
     if (needsFileDecision && action == WorkingFileAction::Ask) {
-        if (hasSavedMapLayout) {
+        if (hasSavedChunkMetadata) {
             message =
-                L"The saved parallel chunk map does not match the current .linkforge.part file. "
-                L"LinkForge cannot safely resume those byte ranges.";
+                L"Saved parallel chunk metadata cannot be safely matched to the current .linkforge.part file. "
+                L"The working file may be missing, empty, or have an unexpected size. "
+                L"LinkForge will keep the saved chunk metadata unless you explicitly choose to abandon it.";
         } else if (singleMirrorOnly) {
             message =
                 L"This sequential download has no safe byte-offset resume information. "
@@ -1550,35 +1551,36 @@ RetryResult Download::Retry(WorkingFileAction action, std::wstring& message) {
                 L"It cannot safely determine which byte ranges can be reused.";
         }
         message +=
-            L"\n\nThe existing .linkforge.part contains data. Choose what to do before restarting from byte zero:\n\n"
-            L"Yes: move it to a uniquely named .partial file for your recovery. LinkForge will immediately forget that file and never inspect or delete it.\n"
-            L"No: permanently delete the existing .linkforge.part file.\n"
-            L"Cancel: do not retry; leave the working file unchanged.";
+            L"\n\nChoose what to do before restarting from byte zero:\n\n"
+            L"Yes: move any non-empty .linkforge.part data to a uniquely named .partial recovery file. "
+            L"If only an empty reservation exists, remove that empty reservation. "
+            L"LinkForge will then forget the working data and saved chunk metadata.\n"
+            L"No: permanently delete the .linkforge.part file if it exists, and discard the saved chunk metadata.\n"
+            L"Cancel: do not retry; leave the working file and saved chunk metadata unchanged.";
         return RetryResult::ConfirmationRequired;
     }
 
     if (needsFileDecision) {
         std::wstring fileActionError;
         if (action == WorkingFileAction::KeepAsUserPartial) {
-            bool fileMoved = false;
-            if (!MoveWorkingFileToUserPartial(partPath, finalPath, fileMoved, fileActionError)) {
-                // The file remains at its working path. Discard the old map so a
-                // later Retry must ask again instead of silently resuming it.
-                ClearResumeDataLocked();
+            if (hasWorkingFileData) {
+                bool fileMoved = false;
+                if (!MoveWorkingFileToUserPartial(partPath, finalPath, fileMoved, fileActionError)) {
+                    lastError = fileActionError;
+                    statusText = L"Retry stopped - working file could not be handed off";
+                    message = fileActionError;
+                    return RetryResult::Failed;
+                }
+            } else if (partExists && !DeleteFileIfPresent(partPath, fileActionError,
+                        L"Could not remove the empty .linkforge.part reservation")) {
                 lastError = fileActionError;
-                statusText = L"Retry stopped - working file could not be handed off";
+                statusText = L"Retry stopped - empty working-file reservation could not be removed";
                 message = fileActionError;
                 return RetryResult::Failed;
-            }
-            if (!fileMoved) {
-                // It disappeared after inspection; there is no recovery file to hand off.
             }
         } else if (action == WorkingFileAction::Delete) {
             if (!DeleteFileIfPresent(partPath, fileActionError,
                                      L"Could not delete the .linkforge.part file after confirmation")) {
-                // Keep the file, but do not allow another Retry to silently resume
-                // after the user explicitly chose to discard it.
-                ClearResumeDataLocked();
                 lastError = fileActionError;
                 statusText = L"Retry stopped - working file could not be deleted";
                 message = fileActionError;
@@ -1586,6 +1588,15 @@ RetryResult Download::Retry(WorkingFileAction action, std::wstring& message) {
             }
         } else {
             return RetryResult::NotRetryable;
+        }
+
+        // The user's decision is effective only after the requested file action
+        // succeeded. This authorization permits the following checkpoint reset.
+        AuthorizeResumeDataDiscardLocked();
+        if (!ClearResumeDataLocked()) {
+            message = L"Retry stopped because saved chunk metadata could not be safely reset. "
+                      L"The remaining working file and checkpoint were kept.";
+            return RetryResult::Failed;
         }
     }
 
@@ -1611,8 +1622,13 @@ RetryResult Download::Retry(WorkingFileAction action, std::wstring& message) {
         restorePending = true;
         sizeKnown = true;
         totalSize = mapTotalSize;
-    } else {
-        ClearResumeDataLocked();
+    } else if (!needsFileDecision) {
+        // No checkpoint or working-file data exists to abandon. The guarded
+        // clear also protects against metadata not covered by the checks above.
+        if (!ClearResumeDataLocked()) {
+            message = L"Retry stopped because saved chunk metadata is still present and has not been explicitly abandoned.";
+            return RetryResult::Failed;
+        }
     }
 
     cancelRequested.store(false);
@@ -1714,6 +1730,7 @@ ModeSwitchResult Download::SwitchMode(bool targetSingleMirrorOnly, WorkingFileAc
 
     std::wstring oldPartPath;
     std::wstring currentFinalPath;
+    bool hasSavedChunkMetadata = false;
     {
         std::lock_guard lock(mutex);
         if (!terminal || (phase != DownloadPhase::Failed && phase != DownloadPhase::Cancelled &&
@@ -1723,6 +1740,7 @@ ModeSwitchResult Download::SwitchMode(bool targetSingleMirrorOnly, WorkingFileAc
         }
         oldPartPath = partPath;
         currentFinalPath = finalPath;
+        hasSavedChunkMetadata = HasSavedChunkMetadataLocked();
     }
 
     const std::wstring newPartPath = currentFinalPath + L".linkforge.part";
@@ -1771,14 +1789,15 @@ ModeSwitchResult Download::SwitchMode(bool targetSingleMirrorOnly, WorkingFileAc
         }
     }
 
-    const bool needsFileDecision = oldPartExists && oldPartSize > 0;
+    const bool needsFileDecision = (oldPartExists && oldPartSize > 0) || hasSavedChunkMetadata;
     if (needsFileDecision && action == WorkingFileAction::Ask) {
         message =
             L"Changing transfer mode requires starting this download again from byte zero. "
-            L"The existing .linkforge.part contains data.\n\n"
-            L"Yes: move it to a uniquely named .partial file for your recovery. LinkForge will immediately forget that file and never inspect or delete it.\n"
-            L"No: permanently delete the existing .linkforge.part file.\n"
-            L"Cancel: do not switch modes; leave the working file unchanged.";
+            L"Any saved parallel chunk metadata will also be discarded.\n\n"
+            L"Yes: move any non-empty .linkforge.part data to a uniquely named .partial recovery file. "
+            L"If only an empty reservation exists, remove that empty reservation.\n"
+            L"No: permanently delete the .linkforge.part file if it exists.\n"
+            L"Cancel: do not switch modes; leave the working file and saved chunk metadata unchanged.";
         return ModeSwitchResult::ConfirmationRequired;
     }
     if (needsFileDecision && action == WorkingFileAction::Cancel)
@@ -1786,11 +1805,13 @@ ModeSwitchResult Download::SwitchMode(bool targetSingleMirrorOnly, WorkingFileAc
 
     if (needsFileDecision) {
         if (action == WorkingFileAction::KeepAsUserPartial) {
-            bool fileMoved = false;
-            if (!MoveWorkingFileToUserPartial(oldPartPath, currentFinalPath, fileMoved, message))
+            if (oldPartExists && oldPartSize > 0) {
+                bool fileMoved = false;
+                if (!MoveWorkingFileToUserPartial(oldPartPath, currentFinalPath, fileMoved, message))
+                    return ModeSwitchResult::Failed;
+            } else if (oldPartExists &&
+                       !DeleteFileIfPresent(oldPartPath, message, L"Could not remove the empty working-file reservation")) {
                 return ModeSwitchResult::Failed;
-            if (!fileMoved) {
-                // It disappeared after inspection; there is no recovery file to hand off.
             }
         } else if (action == WorkingFileAction::Delete) {
             if (!DeleteFileIfPresent(oldPartPath, message,
@@ -1800,16 +1821,21 @@ ModeSwitchResult Download::SwitchMode(bool targetSingleMirrorOnly, WorkingFileAc
             return ModeSwitchResult::NotAvailable;
         }
     } else if (oldPartExists && oldPartPath != newPartPath) {
-        // A zero-byte reservation contains no downloaded data.
+        // A zero-byte reservation with no saved chunk metadata is safe to remove.
         if (!DeleteFileIfPresent(oldPartPath, message, L"Could not remove the empty working-file reservation"))
             return ModeSwitchResult::Failed;
     }
 
     {
         std::lock_guard lock(mutex);
+        if (needsFileDecision) AuthorizeResumeDataDiscardLocked();
+        if (!ClearResumeDataLocked()) {
+            message = L"Mode switch stopped because saved chunk metadata has not been explicitly abandoned. "
+                      L"The existing working file was kept.";
+            return ModeSwitchResult::Failed;
+        }
         partPath = newPartPath;
         singleMirrorOnly = targetSingleMirrorOnly;
-        ClearResumeDataLocked();
         networkBytes = 0;
         firstTransferTick = 0;
         endTransferTick = 0;
@@ -2287,7 +2313,8 @@ bool Download::PrepareParallelFile(std::wstring& error) {
     {
         std::lock_guard lock(mutex);
         sizeToPrepare = totalSize;
-        useRestore = restorePending && restoredTotalSize == totalSize && fileExisted && restoredSegmentBytes > 0;
+        useRestore = restorePending && !restoredMapInvalid &&
+                     restoredTotalSize == totalSize && fileExisted && restoredSegmentBytes > 0;
         if (restorePending && !useRestore) {
             error = L"The saved parallel chunk map cannot be applied to the existing .linkforge.part file; leaving both unchanged.";
             return false;
@@ -2374,19 +2401,56 @@ bool Download::PrepareParallelFile(std::wstring& error) {
         segments.push_back(segment);
     }
     if (useRestore) {
+        // Validate every saved range before converting the restored map into
+        // live Segment state. Never skip an invalid entry and then clear the
+        // only copy of its persisted metadata.
+        std::vector<bool> restoredChunkSeen(segments.size(), false);
         for (const uint64_t index : completedIndices) {
-            if (index >= segments.size()) continue;
+            if (index >= segments.size() || restoredChunkSeen[static_cast<size_t>(index)]) {
+                error = L"The saved parallel chunk map contains an invalid or duplicate completed-chunk index; "
+                        L"the working file and saved metadata were left unchanged.";
+                restoredMapInvalid = true;
+                segments.clear();
+                return false;
+            }
+            restoredChunkSeen[static_cast<size_t>(index)] = true;
+        }
+        for (const auto& [index, bytes] : restoredPartialSegmentBytes) {
+            if (index >= segments.size() || restoredChunkSeen[static_cast<size_t>(index)]) {
+                error = L"The saved parallel chunk map contains an invalid or overlapping partial-chunk index; "
+                        L"the working file and saved metadata were left unchanged.";
+                restoredMapInvalid = true;
+                segments.clear();
+                return false;
+            }
+            const Segment& segment = segments[static_cast<size_t>(index)];
+            const uint64_t segmentLength = segment.end - segment.start + 1;
+            if (bytes == 0 || bytes > segmentLength) {
+                error = L"The saved parallel chunk map contains an invalid partial-chunk byte offset; "
+                        L"the working file and saved metadata were left unchanged.";
+                restoredMapInvalid = true;
+                segments.clear();
+                return false;
+            }
+            restoredChunkSeen[static_cast<size_t>(index)] = true;
+        }
+
+        for (const uint64_t index : completedIndices) {
             Segment& segment = segments[static_cast<size_t>(index)];
             segment.state = 2;
             completedBytes += segment.end - segment.start + 1;
             ++completedSegments;
         }
         for (const auto& [index, bytes] : restoredPartialSegmentBytes) {
-            if (index >= segments.size()) continue;
             Segment& segment = segments[static_cast<size_t>(index)];
-            if (segment.state == 2) continue;
             const uint64_t segmentLength = segment.end - segment.start + 1;
-            if (bytes < segmentLength) segment.committedBytes = bytes;
+            if (bytes == segmentLength) {
+                segment.state = 2;
+                completedBytes += segmentLength;
+                ++completedSegments;
+            } else {
+                segment.committedBytes = bytes;
+            }
         }
     }
     restorePending = false;
@@ -2789,8 +2853,39 @@ bool Download::CleanupPartFile(std::wstring& error) {
     return DeleteFileIfPresent(partPath, error, L"Could not delete the working .linkforge.part file");
 }
 
-void Download::ClearResumeDataLocked() {
+bool Download::HasSavedChunkMetadataLocked() const {
+    if ((persistentSegmentBytes > 0 && totalSize > 0) ||
+        (restoredSegmentBytes > 0 && restoredTotalSize > 0) ||
+        completedSegments > 0 ||
+        !restoredCompletedSegmentIndices.empty() || !restoredPartialSegmentBytes.empty())
+        return true;
+
+    return std::any_of(segments.begin(), segments.end(), [](const Segment& segment) {
+        return segment.state == 2 || segment.committedBytes > 0;
+    });
+}
+
+void Download::AuthorizeResumeDataDiscardLocked() {
+    if (resumeDataDiscardGeneration == std::numeric_limits<uint64_t>::max()) {
+        resumeDataDiscardGeneration = 1;
+        appliedResumeDataDiscardGeneration = 0;
+        persistedResumeDataDiscardGeneration = 0;
+    } else {
+        ++resumeDataDiscardGeneration;
+    }
+}
+
+bool Download::ClearResumeDataLocked() {
+    const bool hasSavedMetadata = HasSavedChunkMetadataLocked();
+    const bool hasUnusedDiscardAuthorization =
+        resumeDataDiscardGeneration > appliedResumeDataDiscardGeneration;
+    if (hasSavedMetadata && !hasUnusedDiscardAuthorization)
+        return false;
+    if (hasUnusedDiscardAuthorization)
+        appliedResumeDataDiscardGeneration = resumeDataDiscardGeneration;
+
     restorePending = false;
+    restoredMapInvalid = false;
     persistentSegmentBytes = 0;
     restoredTotalSize = 0;
     restoredSegmentBytes = 0;
@@ -2826,6 +2921,7 @@ void Download::ClearResumeDataLocked() {
     speedBps = 0.0;
     lastSpeedSampleBytes = networkBytes;
     speedSampleTick = 0;
+    return true;
 }
 
 void Download::FinishCancelled() {
@@ -2858,10 +2954,8 @@ void Download::FinishCancelled() {
         if (!MoveWorkingFileToUserPartial(partPath, finalPath, fileMoved, keepError)) {
             {
                 std::lock_guard lock(mutex);
-                // The user's Keep decision must not leave a resumable checkpoint
-                // behind if the handoff failed. Keep the .linkforge.part file,
-                // discard its map, and require another explicit decision later.
-                ClearResumeDataLocked();
+                // The handoff failed, so neither the working file nor its saved
+                // chunk metadata has been abandoned. Preserve both for another attempt.
                 userPaused = false;
                 pauseRequested.store(false);
                 pauseSettled = false;
@@ -2875,6 +2969,7 @@ void Download::FinishCancelled() {
 
         {
             std::lock_guard lock(mutex);
+            AuthorizeResumeDataDiscardLocked();
             ClearResumeDataLocked();
             userPaused = false;
             pauseRequested.store(false);
@@ -2899,9 +2994,8 @@ void Download::FinishCancelled() {
     if (!CleanupPartFile(deletionError)) {
         {
             std::lock_guard lock(mutex);
-            // A failed delete must not permit a later Retry to silently resume
-            // after the user explicitly chose deletion.
-            ClearResumeDataLocked();
+            // The delete failed, so the working file and its associated
+            // checkpoint must both remain intact.
             userPaused = false;
             pauseRequested.store(false);
             pauseSettled = false;
@@ -2915,6 +3009,7 @@ void Download::FinishCancelled() {
 
     {
         std::lock_guard lock(mutex);
+        AuthorizeResumeDataDiscardLocked();
         ClearResumeDataLocked();
         userPaused = false;
         pauseRequested.store(false);
@@ -3006,12 +3101,21 @@ void Download::RunInternal() {
         return;
     }
     if (!canParallel && singleMirrorOnly) {
-        std::lock_guard lock(mutex);
-        restorePending = false;
-        restoredCompletedSegmentIndices.clear();
-        restoredPartialSegmentBytes.clear();
-        restoredSegmentBytes = 0;
-        persistentSegmentBytes = 0;
+        bool hasSavedChunkMetadata = false;
+        {
+            std::lock_guard lock(mutex);
+            hasSavedChunkMetadata = HasSavedChunkMetadataLocked();
+            if (hasSavedChunkMetadata) {
+                lastError =
+                    L"This download has saved parallel chunk metadata, but the selected single-mirror mode "
+                    L"cannot safely continue that checkpoint. The .linkforge.part file and saved chunks were kept. "
+                    L"Switch back to parallel mode, or explicitly switch modes and choose to abandon the saved data.";
+            }
+        }
+        if (hasSavedChunkMetadata) {
+            SetStatus(*this, DownloadPhase::Failed, L"Saved parallel chunks kept - mode change required");
+            return;
+        }
     }
 
     if (canParallel) {

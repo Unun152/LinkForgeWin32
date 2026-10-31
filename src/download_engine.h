@@ -202,6 +202,7 @@ public:
     std::atomic<bool> pauseRequested{false};
     uint64_t persistentSegmentBytes = 0;
     bool restorePending = false;
+    bool restoredMapInvalid = false;
     uint64_t restoredTotalSize = 0;
     uint64_t restoredSegmentBytes = 0;
     uint64_t restoredReferencePrefixHash = 0;
@@ -212,6 +213,10 @@ public:
     uint64_t referenceSuffixHash = 0;
     std::vector<uint64_t> restoredCompletedSegmentIndices;
     std::vector<std::pair<uint64_t, uint64_t>> restoredPartialSegmentBytes; // restored in-progress chunk offsets
+    // Persistence acknowledges this generation only after the authorized reset is saved.
+    uint64_t resumeDataDiscardGeneration = 0;
+    uint64_t appliedResumeDataDiscardGeneration = 0;
+    uint64_t persistedResumeDataDiscardGeneration = 0;
     bool initialProbeComplete = false;
     bool referenceReady = false;
     // IDs identify active mirrors that currently back the cached reference samples.
@@ -246,7 +251,9 @@ private:
     bool PrepareParallelFile(std::wstring& error);
     bool FinalizeFile(std::wstring& error);
     bool CleanupPartFile(std::wstring& error);
-    void ClearResumeDataLocked(); // caller holds mutex
+    bool HasSavedChunkMetadataLocked() const; // caller holds mutex
+    void AuthorizeResumeDataDiscardLocked(); // caller holds mutex
+    bool ClearResumeDataLocked(); // caller holds mutex; refuses to clear an unconfirmed checkpoint
     void FinishCancelled();
     void ProbeInitialMirrors();
     void ProbeOne(const std::shared_ptr<Mirror>& mirror);

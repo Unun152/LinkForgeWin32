@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cerrno>
 #include <cstdlib>
 #include <cwchar>
 #include <filesystem>
@@ -109,6 +110,8 @@ HBRUSH g_windowBrush = nullptr;
 HBRUSH g_inputBrush = nullptr;
 std::vector<std::shared_ptr<Download>> g_downloads;
 std::vector<HWND> g_detailWindows;
+// Paths removed only after a user-confirmed Remove/Clear Completed operation.
+std::vector<std::wstring> g_authorizedQueueRemovalPaths;
 
 struct TextDialogState {
     HWND hwnd = nullptr;
@@ -297,15 +300,369 @@ std::vector<std::pair<uint64_t, uint64_t>> ParsePartialSegmentList(const std::ws
     return result;
 }
 
+
+struct PersistedResumeCheckpoint {
+    std::wstring finalPath;
+    std::wstring partPath;
+    std::wstring phaseName;
+    bool sizeKnown = false;
+    uint64_t totalSize = 0;
+    uint64_t segmentBytes = 0;
+    uint64_t prefixHash = 0;
+    uint64_t middleHash = 0;
+    uint64_t suffixHash = 0;
+    std::vector<uint64_t> completedSegments;
+    std::vector<std::pair<uint64_t, uint64_t>> partialSegments;
+
+    bool HasMetadata() const {
+        return (totalSize > 0 && segmentBytes > 0) ||
+               !completedSegments.empty() || !partialSegments.empty();
+    }
+};
+
+bool ReadStateUInt64Strict(const wchar_t* section, const std::wstring& key,
+                           const std::wstring& file, uint64_t& result) {
+    const std::wstring value = ReadStateString(section, key, file);
+    if (value.empty() || !std::all_of(value.begin(), value.end(),
+            [](wchar_t c) { return c >= L'0' && c <= L'9'; }))
+        return false;
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = _wcstoui64(value.c_str(), &end, 10);
+    if (!end || end == value.c_str() || *end != L'\0' || errno == ERANGE) return false;
+    result = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+bool ReadPersistedCount(const wchar_t* section, const std::wstring& key,
+                        const std::wstring& file, int maximum, int& result) {
+    const std::wstring value = ReadStateString(section, key, file);
+    if (value.empty()) {
+        result = 0; // Older queue files may omit chunk-count keys when the map is empty.
+        return true;
+    }
+    if (!std::all_of(value.begin(), value.end(),
+            [](wchar_t c) { return c >= L'0' && c <= L'9'; }))
+        return false;
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = _wcstoui64(value.c_str(), &end, 10);
+    if (!end || end == value.c_str() || *end != L'\0' || errno == ERANGE ||
+        parsed > static_cast<unsigned long long>(maximum))
+        return false;
+    result = static_cast<int>(parsed);
+    return true;
+}
+
+bool ParsePersistedIndexChunk(const std::wstring& text, std::vector<uint64_t>& result) {
+    if (text.empty()) return false;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t comma = text.find(L',', start);
+        const std::wstring token = text.substr(
+            start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+        if (token.empty() || !std::all_of(token.begin(), token.end(),
+                [](wchar_t c) { return c >= L'0' && c <= L'9'; }))
+            return false;
+        wchar_t* end = nullptr;
+        errno = 0;
+        const unsigned long long value = _wcstoui64(token.c_str(), &end, 10);
+        if (!end || end == token.c_str() || *end != L'\0' || errno == ERANGE) return false;
+        result.push_back(static_cast<uint64_t>(value));
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return true;
+}
+
+bool ParsePersistedPartialChunk(
+    const std::wstring& text, std::vector<std::pair<uint64_t, uint64_t>>& result) {
+    if (text.empty()) return false;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t comma = text.find(L',', start);
+        const std::wstring token = text.substr(
+            start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+        const size_t colon = token.find(L':');
+        if (token.empty() || colon == std::wstring::npos || colon == 0 ||
+            token.find(L':', colon + 1) != std::wstring::npos)
+            return false;
+        const std::wstring indexText = token.substr(0, colon);
+        const std::wstring bytesText = token.substr(colon + 1);
+        const auto isDecimal = [](const std::wstring& value) {
+            return !value.empty() && std::all_of(value.begin(), value.end(),
+                [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+        };
+        if (!isDecimal(indexText) || !isDecimal(bytesText)) return false;
+        wchar_t* indexEnd = nullptr;
+        wchar_t* bytesEnd = nullptr;
+        errno = 0;
+        const unsigned long long index = _wcstoui64(indexText.c_str(), &indexEnd, 10);
+        if (!indexEnd || indexEnd == indexText.c_str() || *indexEnd != L'\0' || errno == ERANGE)
+            return false;
+        errno = 0;
+        const unsigned long long bytes = _wcstoui64(bytesText.c_str(), &bytesEnd, 10);
+        if (!bytesEnd || bytesEnd == bytesText.c_str() || *bytesEnd != L'\0' ||
+            errno == ERANGE || bytes == 0)
+            return false;
+        result.emplace_back(static_cast<uint64_t>(index), static_cast<uint64_t>(bytes));
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return true;
+}
+
+std::wstring NormalizeQueuePath(const std::wstring& path) {
+    if (path.empty()) return L"";
+    std::wstring result = std::filesystem::path(path).lexically_normal().wstring();
+    std::replace(result.begin(), result.end(), L'/', L'\\');
+    return result;
+}
+
+bool SameQueuePath(const std::wstring& left, const std::wstring& right) {
+    if (left.empty() || right.empty()) return false;
+    const std::wstring normalizedLeft = NormalizeQueuePath(left);
+    const std::wstring normalizedRight = NormalizeQueuePath(right);
+    return _wcsicmp(normalizedLeft.c_str(), normalizedRight.c_str()) == 0;
+}
+
+bool IsValidWorkingPartPath(const std::wstring& partPath, const std::wstring& folder) {
+    constexpr wchar_t suffix[] = L".linkforge.part";
+    if (partPath.size() < std::size(suffix) - 1 || folder.empty()) return false;
+    if (_wcsicmp(partPath.c_str() + partPath.size() - (std::size(suffix) - 1), suffix) != 0)
+        return false;
+    const std::wstring parent = std::filesystem::path(partPath).parent_path().wstring();
+    return SameQueuePath(parent, folder);
+}
+
+std::wstring GetValidatedWorkingPartPath(const PersistedResumeCheckpoint& checkpoint) {
+    const std::filesystem::path finalPath(checkpoint.finalPath);
+    const std::wstring folder = finalPath.parent_path().wstring();
+    if (IsValidWorkingPartPath(checkpoint.partPath, folder))
+        return checkpoint.partPath;
+
+    const std::wstring canonicalPartPath = checkpoint.finalPath + L".linkforge.part";
+    return IsValidWorkingPartPath(canonicalPartPath, folder) ? canonicalPartPath : L"";
+}
+
+bool HasWorkingFileData(const PersistedResumeCheckpoint& checkpoint) {
+    const std::wstring validatedPartPath = GetValidatedWorkingPartPath(checkpoint);
+    if (validatedPartPath.empty()) return false;
+
+    std::error_code fileError;
+    const std::filesystem::path workingPath(validatedPartPath);
+    const bool exists = std::filesystem::exists(workingPath, fileError);
+    if (fileError) return true; // Fail closed: an inspection error must not discard the queue record.
+    if (!exists) return false;
+
+    const uint64_t size = std::filesystem::file_size(workingPath, fileError);
+    return fileError || size > 0;
+}
+
+bool HasProtectedResumeData(const PersistedResumeCheckpoint& checkpoint) {
+    return checkpoint.HasMetadata() || HasWorkingFileData(checkpoint);
+}
+
+void AuthorizeQueueRemoval(const std::wstring& finalPath) {
+    if (finalPath.empty()) return;
+    const bool alreadyAuthorized = std::any_of(
+        g_authorizedQueueRemovalPaths.begin(), g_authorizedQueueRemovalPaths.end(),
+        [&](const std::wstring& path) { return SameQueuePath(path, finalPath); });
+    if (!alreadyAuthorized) g_authorizedQueueRemovalPaths.push_back(finalPath);
+}
+
+bool IsQueueRemovalAuthorized(const std::wstring& finalPath) {
+    return std::any_of(
+        g_authorizedQueueRemovalPaths.begin(), g_authorizedQueueRemovalPaths.end(),
+        [&](const std::wstring& path) { return SameQueuePath(path, finalPath); });
+}
+
+void RevokeQueueRemovalAuthorization(const std::wstring& finalPath) {
+    g_authorizedQueueRemovalPaths.erase(
+        std::remove_if(g_authorizedQueueRemovalPaths.begin(), g_authorizedQueueRemovalPaths.end(),
+            [&](const std::wstring& path) { return SameQueuePath(path, finalPath); }),
+        g_authorizedQueueRemovalPaths.end());
+}
+
+std::vector<PersistedResumeCheckpoint> LoadPersistedResumeCheckpoints(
+    const std::wstring& file, bool& stateFileReadable) {
+    std::vector<PersistedResumeCheckpoint> checkpoints;
+    stateFileReadable = false;
+    if (file.empty()) return checkpoints;
+
+    HANDLE stateFile = CreateFileW(file.c_str(), GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (stateFile == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+            stateFileReadable = true;
+        return checkpoints;
+    }
+    CloseHandle(stateFile);
+    int count = 0;
+    if (!ReadPersistedCount(L"Downloads", L"Count", file, 10000, count)) return checkpoints;
+    const std::wstring countText = ReadStateString(L"Downloads", L"Count", file);
+    if (countText.empty()) return checkpoints;
+    stateFileReadable = true;
+    checkpoints.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        const std::wstring section = L"Download" + std::to_wstring(i);
+        PersistedResumeCheckpoint checkpoint;
+        checkpoint.finalPath = ReadStateString(section.c_str(), L"FinalPath", file);
+        if (checkpoint.finalPath.empty()) {
+            const std::wstring folder = ReadStateString(section.c_str(), L"Folder", file);
+            const std::wstring filename = ReadStateString(section.c_str(), L"FileName", file);
+            if (!folder.empty() && !filename.empty())
+                checkpoint.finalPath = (std::filesystem::path(folder) / filename).wstring();
+        }
+        if (checkpoint.finalPath.empty()) {
+            stateFileReadable = false;
+            checkpoints.clear();
+            return checkpoints;
+        }
+
+        checkpoint.partPath = ReadStateString(section.c_str(), L"PartPath", file);
+        checkpoint.phaseName = ReadStateString(section.c_str(), L"Phase", file);
+        checkpoint.sizeKnown = GetPrivateProfileIntW(
+            section.c_str(), L"SizeKnown", 0, file.c_str()) != 0;
+        if (!ReadStateUInt64Strict(section.c_str(), L"TotalSize", file, checkpoint.totalSize) ||
+            !ReadStateUInt64Strict(section.c_str(), L"SegmentBytes", file, checkpoint.segmentBytes) ||
+            !ReadStateUInt64Strict(section.c_str(), L"ReferencePrefixHash", file, checkpoint.prefixHash) ||
+            !ReadStateUInt64Strict(section.c_str(), L"ReferenceMiddleHash", file, checkpoint.middleHash) ||
+            !ReadStateUInt64Strict(section.c_str(), L"ReferenceSuffixHash", file, checkpoint.suffixHash)) {
+            stateFileReadable = false;
+            checkpoints.clear();
+            return checkpoints;
+        }
+
+        int completedChunkCount = 0;
+        if (!ReadPersistedCount(section.c_str(), L"CompletedChunkCount", file, 10000, completedChunkCount)) {
+            stateFileReadable = false;
+            checkpoints.clear();
+            return checkpoints;
+        }
+        for (int c = 0; c < completedChunkCount; ++c) {
+            const auto chunk = ReadStateString(
+                section.c_str(), L"CompletedChunk" + std::to_wstring(c), file);
+            if (!ParsePersistedIndexChunk(chunk, checkpoint.completedSegments)) {
+                stateFileReadable = false;
+                checkpoints.clear();
+                return checkpoints;
+            }
+        }
+
+        int partialChunkCount = 0;
+        if (!ReadPersistedCount(section.c_str(), L"PartialChunkCount", file, 10000, partialChunkCount)) {
+            stateFileReadable = false;
+            checkpoints.clear();
+            return checkpoints;
+        }
+        for (int c = 0; c < partialChunkCount; ++c) {
+            const auto chunk = ReadStateString(
+                section.c_str(), L"PartialChunk" + std::to_wstring(c), file);
+            if (!ParsePersistedPartialChunk(chunk, checkpoint.partialSegments)) {
+                stateFileReadable = false;
+                checkpoints.clear();
+                return checkpoints;
+            }
+        }
+        checkpoints.push_back(std::move(checkpoint));
+    }
+    return checkpoints;
+}
+
+const PersistedResumeCheckpoint* FindPersistedCheckpoint(
+    const std::vector<PersistedResumeCheckpoint>& checkpoints,
+    const std::wstring& finalPath) {
+    const auto found = std::find_if(checkpoints.begin(), checkpoints.end(),
+        [&](const PersistedResumeCheckpoint& checkpoint) {
+            return SameQueuePath(checkpoint.finalPath, finalPath);
+        });
+    return found == checkpoints.end() ? nullptr : &*found;
+}
+
+bool PreviousCheckpointMustBePreserved(
+    const PersistedResumeCheckpoint& previous,
+    bool currentHasMetadata,
+    uint64_t totalSize,
+    uint64_t segmentBytes,
+    uint64_t prefixHash,
+    uint64_t middleHash,
+    uint64_t suffixHash,
+    const std::vector<uint64_t>& completedSegments,
+    const std::vector<std::pair<uint64_t, uint64_t>>& partialSegments) {
+    if (!previous.HasMetadata()) return false;
+    if (!currentHasMetadata) return true;
+
+    // A checkpoint can advance, but an unconfirmed reset must not change its
+    // geometry/source fingerprint or make any previously committed range regress.
+    if (previous.totalSize != totalSize || previous.segmentBytes != segmentBytes ||
+        previous.prefixHash != prefixHash || previous.middleHash != middleHash ||
+        previous.suffixHash != suffixHash)
+        return true;
+
+    for (const uint64_t oldIndex : previous.completedSegments) {
+        if (std::find(completedSegments.begin(), completedSegments.end(), oldIndex) == completedSegments.end())
+            return true;
+    }
+    for (const auto& [oldIndex, oldBytes] : previous.partialSegments) {
+        if (std::find(completedSegments.begin(), completedSegments.end(), oldIndex) != completedSegments.end())
+            continue;
+        const auto current = std::find_if(partialSegments.begin(), partialSegments.end(),
+            [&](const auto& item) { return item.first == oldIndex; });
+        if (current == partialSegments.end() || current->second < oldBytes) return true;
+    }
+    return false;
+}
+
 bool PersistDownloadsToFile(bool applicationShutdown = false) {
     if (g_downloadsStatePath.empty()) g_downloadsStatePath = GetDownloadsStateFilePath();
+    bool previousStateReadable = false;
+    const auto previousCheckpoints =
+        LoadPersistedResumeCheckpoints(g_downloadsStatePath, previousStateReadable);
+    if (!previousStateReadable) return false;
+
+    std::vector<std::pair<std::shared_ptr<Download>, uint64_t>> discardGenerationsToAcknowledge;
+    std::vector<std::wstring> currentFinalPaths;
+    currentFinalPaths.reserve(g_downloads.size());
+    for (const auto& download : g_downloads) {
+        std::lock_guard lock(download->mutex);
+        currentFinalPaths.push_back(download->finalPath);
+    }
+
+    // An in-memory queue item disappearing must not erase its saved chunk map.
+    // Only an explicit UI removal authorizes dropping an unrepresented checkpoint.
+    for (const auto& previous : previousCheckpoints) {
+        if (!HasProtectedResumeData(previous) || previous.phaseName == L"Completed") continue;
+        const bool stillQueued = std::any_of(currentFinalPaths.begin(), currentFinalPaths.end(),
+            [&](const std::wstring& path) { return SameQueuePath(path, previous.finalPath); });
+        if (stillQueued) continue;
+        if (!IsQueueRemovalAuthorized(previous.finalPath)) return false;
+    }
+
     const std::wstring tempPath = g_downloadsStatePath + L".tmp";
-    DeleteFileW(tempPath.c_str());
-    if (g_downloads.empty()) {
-        DeleteFileW(tempPath.c_str());
-        if (DeleteFileW(g_downloadsStatePath.c_str())) return true;
+    if (!DeleteFileW(tempPath.c_str())) {
         const DWORD deleteError = GetLastError();
-        return deleteError == ERROR_FILE_NOT_FOUND || deleteError == ERROR_PATH_NOT_FOUND;
+        if (deleteError != ERROR_FILE_NOT_FOUND && deleteError != ERROR_PATH_NOT_FOUND)
+            return false;
+    }
+    if (g_downloads.empty()) {
+        if (!DeleteFileW(tempPath.c_str())) {
+            const DWORD tempError = GetLastError();
+            if (tempError != ERROR_FILE_NOT_FOUND && tempError != ERROR_PATH_NOT_FOUND)
+                return false;
+        }
+        if (DeleteFileW(g_downloadsStatePath.c_str())) {
+            g_authorizedQueueRemovalPaths.clear();
+            return true;
+        }
+        const DWORD deleteError = GetLastError();
+        if (deleteError == ERROR_FILE_NOT_FOUND || deleteError == ERROR_PATH_NOT_FOUND) {
+            g_authorizedQueueRemovalPaths.clear();
+            return true;
+        }
+        return false;
     }
 
     const std::wstring downloadsSection = L"Downloads";
@@ -325,6 +682,8 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         bool sizeKnown = false, userPaused = false, completed = false, failed = false, cancelled = false;
         bool cancelledKept = false, autoResume = false;
         bool singleMirrorOnly = false;
+        uint64_t discardGeneration = 0;
+        uint64_t persistedDiscardGeneration = 0;
         {
             std::lock_guard lock(download->mutex);
             folder = download->outputFolder;
@@ -345,6 +704,8 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
                                        !download->shutdownRequested.load() && !cancelledKept;
             cancelled = download->phase == DownloadPhase::Cancelled || cancelPending;
             singleMirrorOnly = download->singleMirrorOnly;
+            discardGeneration = download->resumeDataDiscardGeneration;
+            persistedDiscardGeneration = download->persistedResumeDataDiscardGeneration;
             for (const auto& mirror : download->mirrors) if (mirror->active) urls.push_back(mirror->url);
             if (!download->segments.empty()) {
                 for (size_t index = 0; index < download->segments.size(); ++index) {
@@ -357,7 +718,7 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
                 partialSegments = download->restoredPartialSegmentBytes;
             }
             if (completed) phaseName = L"Completed";
-            else if (failed) phaseName = L"Failed";
+            else if (failed || cancelPending) phaseName = L"Failed";
             else if (cancelledKept) phaseName = L"CancelledKept";
             else if (cancelled) phaseName = L"Cancelled";
             else if (userPaused || download->phase == DownloadPhase::Paused) phaseName = L"Paused";
@@ -367,6 +728,33 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
                 std::find(g_shutdownResumeDownloads.begin(), g_shutdownResumeDownloads.end(), download.get()) != g_shutdownResumeDownloads.end())
                 autoResume = true;
         }
+
+        const bool currentHasCheckpointMetadata =
+            (totalSize > 0 && segmentBytes > 0) || !completedSegments.empty() || !partialSegments.empty();
+        const PersistedResumeCheckpoint* previousCheckpoint =
+            FindPersistedCheckpoint(previousCheckpoints, finalPath);
+        const bool discardWasExplicitlyAuthorized = discardGeneration > persistedDiscardGeneration;
+        if (!discardWasExplicitlyAuthorized && previousCheckpoint &&
+            (PreviousCheckpointMustBePreserved(*previousCheckpoint, currentHasCheckpointMetadata,
+                totalSize, segmentBytes, prefixHash, middleHash, suffixHash,
+                completedSegments, partialSegments) ||
+             (HasWorkingFileData(*previousCheckpoint) &&
+              !SameQueuePath(GetValidatedWorkingPartPath(*previousCheckpoint), partPath)))) {
+            sizeKnown = previousCheckpoint->sizeKnown;
+            totalSize = previousCheckpoint->totalSize;
+            segmentBytes = previousCheckpoint->segmentBytes;
+            prefixHash = previousCheckpoint->prefixHash;
+            middleHash = previousCheckpoint->middleHash;
+            suffixHash = previousCheckpoint->suffixHash;
+            completedSegments = previousCheckpoint->completedSegments;
+            partialSegments = previousCheckpoint->partialSegments;
+            const std::wstring previousWorkingPath =
+                GetValidatedWorkingPartPath(*previousCheckpoint);
+            if (!previousWorkingPath.empty())
+                partPath = previousWorkingPath;
+        }
+        if (discardWasExplicitlyAuthorized)
+            discardGenerationsToAcknowledge.emplace_back(download, discardGeneration);
 
         ok &= WriteStateString(tempPath, section.c_str(), L"Folder", folder);
         ok &= WriteStateString(tempPath, section.c_str(), L"FileName", filename);
@@ -433,8 +821,19 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
     const bool flushed = FlushFileBuffers(file) != FALSE;
     CloseHandle(file);
     if (!flushed) return false;
-    return MoveFileExW(tempPath.c_str(), g_downloadsStatePath.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    if (!MoveFileExW(tempPath.c_str(), g_downloadsStatePath.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return false;
+
+    // A confirmed discard is consumed only after the replacement INI has been
+    // flushed and atomically installed. A failed save leaves authorization pending.
+    for (const auto& [download, generation] : discardGenerationsToAcknowledge) {
+        std::lock_guard lock(download->mutex);
+        if (download->resumeDataDiscardGeneration == generation)
+            download->persistedResumeDataDiscardGeneration = generation;
+    }
+    g_authorizedQueueRemovalPaths.clear();
+    return true;
 }
 
 void LoadDownloadsFromFile() {
@@ -486,7 +885,7 @@ void LoadDownloadsFromFile() {
         resume.wasPaused = GetPrivateProfileIntW(section.c_str(), L"UserPaused", 0, g_downloadsStatePath.c_str()) != 0 &&
             !resume.wasCompleted && !resume.wasFailed && !resume.wasCancelled && !resume.wasCancelledKept;
         const bool autoResume = GetPrivateProfileIntW(section.c_str(), L"AutoResume", 0, g_downloadsStatePath.c_str()) != 0;
-        if (!resume.wasCancelled && !resume.wasCancelledKept) {
+        if (!resume.wasCompleted) {
             const int chunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"CompletedChunkCount", 0,
                                                                                       g_downloadsStatePath.c_str())), 0, 10000);
             for (int c = 0; c < chunkCount; ++c) {
@@ -2182,6 +2581,13 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
                 }
             }
 
+            std::wstring removedFinalPath;
+            {
+                std::lock_guard lock(download->mutex);
+                removedFinalPath = download->finalPath;
+            }
+            if (!completed) AuthorizeQueueRemoval(removedFinalPath);
+
             std::vector<HWND> detailWindowsToClose;
             for (HWND detailWindow : g_detailWindows) {
                 auto* detailContext = reinterpret_cast<DetailsContext*>(GetWindowLongPtrW(detailWindow, GWLP_USERDATA));
@@ -2189,6 +2595,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
             g_downloads.erase(g_downloads.begin() + index);
             if (!PersistDownloadsToFile()) {
+                RevokeQueueRemovalAuthorization(removedFinalPath);
                 g_downloads.insert(g_downloads.begin() + std::min(index, static_cast<int>(g_downloads.size())), download);
                 g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
                 const std::wstring saveError = completed
@@ -2229,6 +2636,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 
             if (!PersistDownloadsToFile()) {
                 g_downloads = previousDownloads;
+                g_authorizedQueueRemovalPaths.clear();
                 g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
                 MessageBoxW(hwnd, L"Could not update the download queue file. Completed entries have been restored in the list; no downloaded files were changed.",
                             L"Could not clear completed entries", MB_OK | MB_ICONERROR);
