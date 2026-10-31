@@ -1639,12 +1639,17 @@ RetryResult Download::Retry(WorkingFileAction action, std::wstring& message) {
     parallelPoolPaused = false;
     parallelMode = false;
     referenceReady = false;
+    referenceMirrorId = -1;
+    rangeReferenceMirrorId = -1;
     referenceSizeKnown = false;
     referenceSize = 0;
     referencePrefix.clear();
     rangeReferenceReady = false;
     rangeReferenceMiddle.clear();
     rangeReferenceSuffix.clear();
+    referencePrefixHash = 0;
+    referenceMiddleHash = 0;
+    referenceSuffixHash = 0;
     segments.clear();
 
     for (auto& mirror : mirrors) {
@@ -1859,6 +1864,10 @@ bool Download::RemoveMirror(int mirrorId) {
             mirror->active = false;
             mirror->state = L"Removed";
             mirror->lastError.clear();
+            // Rebind cached reference fingerprints to another active mirror with
+            // identical samples when possible. Do not replace the fingerprint:
+            // saved chunks must remain tied to the version they were downloaded from.
+            ReevaluateMirrorsLocked();
             cv.notify_all();
             return true;
         }
@@ -2007,28 +2016,82 @@ void Download::ProbeOne(const std::shared_ptr<Mirror>& mirror) {
 }
 
 void Download::ReevaluateMirrorsLocked() {
+    // Reference samples are a snapshot of the version against which the saved
+    // chunks were created. If their source mirror is removed, retain that snapshot
+    // and only rebind its source ID to an active mirror with identical samples.
+    // Never silently adopt a different file version mid-download.
+    if (referenceReady) {
+        auto activeReference = std::find_if(mirrors.begin(), mirrors.end(), [&](const auto& mirror) {
+            return mirror->id == referenceMirrorId && mirror->active &&
+                   mirror->probeDone && mirror->probeOk &&
+                   mirror->prefixSample == referencePrefix &&
+                   (!referenceSizeKnown || (mirror->sizeKnown && mirror->size == referenceSize));
+        });
+        if (activeReference == mirrors.end()) referenceMirrorId = -1;
+
+        if (referenceMirrorId < 0) {
+            activeReference = std::find_if(mirrors.begin(), mirrors.end(), [&](const auto& mirror) {
+                return mirror->active && mirror->probeDone && mirror->probeOk &&
+                       mirror->prefixSample == referencePrefix &&
+                       (!referenceSizeKnown || (mirror->sizeKnown && mirror->size == referenceSize));
+            });
+            if (activeReference != mirrors.end()) referenceMirrorId = (*activeReference)->id;
+        }
+    }
+
+    if (rangeReferenceReady) {
+        auto activeRangeReference = std::find_if(mirrors.begin(), mirrors.end(), [&](const auto& mirror) {
+            return mirror->id == rangeReferenceMirrorId && mirror->active &&
+                   mirror->probeDone && mirror->probeOk && mirror->rangeCapable &&
+                   mirror->sizeKnown && (!referenceSizeKnown || mirror->size == referenceSize) &&
+                   mirror->prefixSample == referencePrefix &&
+                   mirror->middleSample == rangeReferenceMiddle &&
+                   mirror->suffixSample == rangeReferenceSuffix;
+        });
+        if (activeRangeReference == mirrors.end()) rangeReferenceMirrorId = -1;
+
+        if (rangeReferenceMirrorId < 0) {
+            activeRangeReference = std::find_if(mirrors.begin(), mirrors.end(), [&](const auto& mirror) {
+                return mirror->active && mirror->probeDone && mirror->probeOk && mirror->rangeCapable &&
+                       mirror->sizeKnown && (!referenceSizeKnown || mirror->size == referenceSize) &&
+                       mirror->prefixSample == referencePrefix &&
+                       mirror->middleSample == rangeReferenceMiddle &&
+                       mirror->suffixSample == rangeReferenceSuffix;
+            });
+            if (activeRangeReference != mirrors.end()) rangeReferenceMirrorId = (*activeRangeReference)->id;
+        }
+    }
+
     if (!referenceReady) {
-        // Prefer a range-capable mirror with known size as the reference.
-        auto reference = std::find_if(mirrors.begin(), mirrors.end(), [](const auto& m) {
-            return m->active && m->probeDone && m->probeOk && m->rangeCapable && m->sizeKnown && !m->prefixSample.empty();
+        // Prefer an active, range-capable mirror with known size as the reference.
+        auto reference = std::find_if(mirrors.begin(), mirrors.end(), [](const auto& mirror) {
+            return mirror->active && mirror->probeDone && mirror->probeOk &&
+                   mirror->rangeCapable && mirror->sizeKnown &&
+                   !mirror->prefixSample.empty() &&
+                   !mirror->middleSample.empty() && !mirror->suffixSample.empty();
         });
         if (reference == mirrors.end()) {
-            reference = std::find_if(mirrors.begin(), mirrors.end(), [](const auto& m) {
-                return m->active && m->probeDone && m->probeOk && !m->prefixSample.empty();
+            reference = std::find_if(mirrors.begin(), mirrors.end(), [](const auto& mirror) {
+                return mirror->active && mirror->probeDone && mirror->probeOk &&
+                       !mirror->prefixSample.empty();
             });
         }
         if (reference == mirrors.end()) {
-            reference = std::find_if(mirrors.begin(), mirrors.end(), [](const auto& m) {
-                return m->active && m->probeDone && m->probeOk && m->sizeKnown && m->size == 0;
+            reference = std::find_if(mirrors.begin(), mirrors.end(), [](const auto& mirror) {
+                return mirror->active && mirror->probeDone && mirror->probeOk &&
+                       mirror->sizeKnown && mirror->size == 0;
             });
         }
         if (reference != mirrors.end()) {
             referenceReady = true;
+            referenceMirrorId = (*reference)->id;
             referenceSizeKnown = (*reference)->sizeKnown;
             referenceSize = (*reference)->size;
             referencePrefix = (*reference)->prefixSample;
-            if ((*reference)->rangeCapable && (*reference)->sizeKnown) {
+            if ((*reference)->rangeCapable && (*reference)->sizeKnown &&
+                !(*reference)->middleSample.empty() && !(*reference)->suffixSample.empty()) {
                 rangeReferenceReady = true;
+                rangeReferenceMirrorId = (*reference)->id;
                 rangeReferenceMiddle = (*reference)->middleSample;
                 rangeReferenceSuffix = (*reference)->suffixSample;
             }
@@ -2037,15 +2100,17 @@ void Download::ReevaluateMirrorsLocked() {
 
     if (!referenceReady) return;
 
-    // If the first usable reference did not support ranges, a later compatible ranged
-    // mirror can establish the tail sample needed for range-based scheduling.
+    // If the first usable reference did not support ranges, a later active,
+    // compatible ranged mirror can establish the middle and tail samples.
     if (!rangeReferenceReady) {
         for (const auto& mirror : mirrors) {
-            if (!mirror->probeDone || !mirror->probeOk || !mirror->rangeCapable || !mirror->sizeKnown) continue;
+            if (!mirror->active || !mirror->probeDone || !mirror->probeOk ||
+                !mirror->rangeCapable || !mirror->sizeKnown) continue;
             if (referenceSizeKnown && mirror->size != referenceSize) continue;
-            if (mirror->prefixSample != referencePrefix) continue;
-            if (mirror->suffixSample.empty()) continue;
+            if (mirror->prefixSample != referencePrefix ||
+                mirror->middleSample.empty() || mirror->suffixSample.empty()) continue;
             rangeReferenceReady = true;
+            rangeReferenceMirrorId = mirror->id;
             rangeReferenceMiddle = mirror->middleSample;
             rangeReferenceSuffix = mirror->suffixSample;
             referenceSizeKnown = true;
@@ -2055,6 +2120,11 @@ void Download::ReevaluateMirrorsLocked() {
     }
 
     for (auto& mirror : mirrors) {
+        if (!mirror->active) {
+            mirror->compatible = false;
+            mirror->state = L"Removed";
+            continue;
+        }
         if (!mirror->probeDone || !mirror->probeOk) {
             mirror->compatible = false;
             continue;
@@ -2063,19 +2133,20 @@ void Download::ReevaluateMirrorsLocked() {
         if (referenceSizeKnown && mirror->sizeKnown && mirror->size != referenceSize) same = false;
         if (referenceSizeKnown && !mirror->sizeKnown) same = false;
         mirror->compatible = same;
-        if (!mirror->active) {
-            mirror->state = L"Removed";
-        } else if (!same) {
+        if (!same) {
             mirror->state = L"Incompatible sample";
             mirror->lastError = L"Size or sampled bytes do not match the reference mirror";
-        } else if (mirror->rangeCapable && rangeReferenceReady && mirror->middleSample == rangeReferenceMiddle &&
-                   mirror->suffixSample == rangeReferenceSuffix && mirror->sizeKnown && referenceSizeKnown &&
+        } else if (mirror->rangeCapable && rangeReferenceReady &&
+                   mirror->middleSample == rangeReferenceMiddle &&
+                   mirror->suffixSample == rangeReferenceSuffix &&
+                   mirror->sizeKnown && referenceSizeKnown &&
                    mirror->size == referenceSize && !mirror->rangeFailed) {
             mirror->state = L"Sample-compatible - ranges ready";
         } else if (mirror->rangeCapable && !rangeReferenceReady) {
             mirror->state = L"Ranges available; checking";
         } else if (mirror->rangeCapable && rangeReferenceReady &&
-                   (mirror->middleSample != rangeReferenceMiddle || mirror->suffixSample != rangeReferenceSuffix)) {
+                   (mirror->middleSample != rangeReferenceMiddle ||
+                    mirror->suffixSample != rangeReferenceSuffix)) {
             mirror->state = L"Incompatible samples";
             mirror->lastError = L"A middle or end sample does not match the reference mirror";
             mirror->compatible = false;
@@ -2741,6 +2812,8 @@ void Download::ClearResumeDataLocked() {
     fallbackBytes = 0;
 
     referenceReady = false;
+    referenceMirrorId = -1;
+    rangeReferenceMirrorId = -1;
     referenceSizeKnown = false;
     referenceSize = 0;
     referencePrefix.clear();
