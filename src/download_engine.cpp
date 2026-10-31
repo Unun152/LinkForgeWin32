@@ -872,7 +872,7 @@ FullResult DownloadFull(Download& download, const std::shared_ptr<Mirror>& mirro
             // cannot generally resume from a byte offset after process restart, but
             // flushing here at least preserves the partial bytes already received.
             if (!FlushFileBuffers(output)) {
-                result.error = L"Could not flush paused partial download: " + std::to_wstring(GetLastError());
+                result.error = L"Could not flush paused .linkforge.part data: " + std::to_wstring(GetLastError());
                 break;
             }
             {
@@ -1141,7 +1141,7 @@ std::wstring PhaseToString(DownloadPhase phase) {
     case DownloadPhase::Completed: return L"Completed";
     case DownloadPhase::Failed: return L"Failed";
     case DownloadPhase::Cancelled: return L"Cancelled";
-    case DownloadPhase::CancelledKept: return L"Cancelled - partial kept";
+    case DownloadPhase::CancelledKept: return L"Cancelled - recovery file handed off";
     case DownloadPhase::Paused: return L"Paused";
     }
     return L"Unknown";
@@ -1328,7 +1328,7 @@ void Download::Start() {
     statusText = L"Checking mirrors";
     cancelRequested.store(false);
     shutdownRequested.store(false);
-    keepPartialOnCancel.store(false);
+    keepWorkingFileOnCancel.store(false);
     stopProbeRequests.store(false);
     speedBps = 0.0;
     lastSpeedSampleBytes = networkBytes;
@@ -1337,21 +1337,21 @@ void Download::Start() {
     managerThread = std::thread([self]() { self->Run(); });
 }
 
-bool Download::RequestCancel(bool keepPartial) {
+bool Download::RequestCancel(bool keepWorkingFile) {
     bool finishImmediately = false;
     {
         std::lock_guard lock(mutex);
         if (phase == DownloadPhase::Completed || shutdownRequested.load()) return false;
 
-        keepPartialOnCancel.store(keepPartial);
+        keepWorkingFileOnCancel.store(keepWorkingFile);
         cancelRequested.store(true);
         stopProbeRequests.store(true);
         finishImmediately = terminal || !started;
         if (!finishImmediately) {
             userPaused = false;
             statusText = keepPartial
-                ? L"Cancelling; keeping partial data..."
-                : L"Cancelling; deleting partial data...";
+                ? L"Cancelling; handing the unfinished working file to you..."
+                : L"Cancelling; deleting the unfinished working file...";
         }
     }
 
@@ -1620,7 +1620,7 @@ RetryResult Download::Retry(WorkingFileAction action, std::wstring& message) {
     userPaused = false;
     pauseSettled = false;
     pauseCheckpointPending = false;
-    keepPartialOnCancel.store(false);
+    keepWorkingFileOnCancel.store(false);
     stopProbeRequests.store(false);
     terminal = false;
     started = false;
@@ -2182,7 +2182,7 @@ bool Download::PrepareParallelFile(std::wstring& error) {
                 return false;
             }
             if (restoredTotalSize != totalSize) {
-                error = L"The source file size changed since the saved parallel chunk map was created. The existing partial file and saved map were left untouched. Use Retry with the original source, or explicitly switch modes to restart with this version.";
+                error = L"The source file size changed since the saved parallel chunk map was created. The existing .linkforge.part file and saved map were left untouched. Use Retry with the original source, or explicitly switch modes to restart with this version.";
                 return false;
             }
         }
@@ -2217,7 +2217,7 @@ bool Download::PrepareParallelFile(std::wstring& error) {
         sizeToPrepare = totalSize;
         useRestore = restorePending && restoredTotalSize == totalSize && fileExisted && restoredSegmentBytes > 0;
         if (restorePending && !useRestore) {
-            error = L"The saved parallel chunk map cannot be applied to the existing partial file; leaving both unchanged.";
+            error = L"The saved parallel chunk map cannot be applied to the existing .linkforge.part file; leaving both unchanged.";
             return false;
         }
         if (useRestore) {
@@ -2238,14 +2238,14 @@ bool Download::PrepareParallelFile(std::wstring& error) {
     LARGE_INTEGER existingSize{};
     const bool existingSizeKnown = GetFileSizeEx(file, &existingSize) != FALSE;
     if (useRestore && (!existingSizeKnown || existingSize.QuadPart != static_cast<LONGLONG>(sizeToPrepare))) {
-        // Do not resize or overwrite a partial file whose saved chunk offsets refer
+        // Do not resize or overwrite a .linkforge.part file whose saved chunk offsets refer
         // to a different file length. Keep both the file and its resume metadata.
-        error = L"The existing partial file size does not match the saved resume information; the file was left unchanged.";
+        error = L"The existing .linkforge.part file size does not match the saved resume information; the working file was left unchanged.";
         CloseHandle(file);
         return false;
     }
     if (!useRestore && fileExisted && !existingSizeKnown) {
-        error = L"Could not inspect the existing partial file size; leaving the file unchanged.";
+        error = L"Could not inspect the existing .linkforge.part file size; leaving the working file unchanged.";
         CloseHandle(file);
         return false;
     }
@@ -2662,8 +2662,10 @@ bool Download::RunFallback() {
 
             ++mirror->fallbackAttempts;
             mirror->lastError = result.error;
-            if (result.bytes > 0 ||
-                result.error.find(L"existing sequential partial file contains data") != std::wstring::npos) {
+            const bool existingWorkingFileContainsData =
+                result.error.find(L".linkforge.part file contains data") != std::wstring::npos ||
+                result.error.find(L"working .linkforge.part file became non-empty") != std::wstring::npos;
+            if (result.bytes > 0 || existingWorkingFileContainsData) {
                 mirror->fallbackTried = true;
                 mirror->state = L"Failed - working file kept";
                 lastError = result.bytes > 0
@@ -2776,7 +2778,7 @@ void Download::FinishCancelled() {
         return;
     }
 
-    if (keepPartialOnCancel.load()) {
+    if (keepWorkingFileOnCancel.load()) {
         bool fileMoved = false;
         std::wstring keepError;
         if (!MoveWorkingFileToUserPartial(partPath, finalPath, fileMoved, keepError)) {
@@ -2892,7 +2894,7 @@ void Download::RunInternal() {
     if (restoredDataUnverified) {
         {
             std::lock_guard lock(mutex);
-            lastError = L"Could not validate the saved partial file because no usable parallel-range reference is currently available. The partial file and saved chunk progress were kept; check the mirrors and press Retry again.";
+            lastError = L"Could not validate the saved .linkforge.part file because no usable parallel-range reference is currently available. The working file and saved chunk progress were kept; check the mirrors and press Retry again.";
         }
         SetStatus(*this, DownloadPhase::Failed, L"Saved chunks kept - mirror check needed");
         return;
@@ -2900,7 +2902,7 @@ void Download::RunInternal() {
     if (restoredDataMismatch) {
         {
             std::lock_guard lock(mutex);
-            lastError = L"The current mirrors do not match the file version used for the saved chunks. The old partial file and chunk progress were kept; refusing to overwrite or combine different file versions.";
+            lastError = L"The current mirrors do not match the file version used for the saved chunks. The existing .linkforge.part file and chunk progress were kept; refusing to overwrite or combine different file versions.";
         }
         SetStatus(*this, DownloadPhase::Failed, L"Source version mismatch - saved data kept");
         return;
@@ -2920,13 +2922,13 @@ void Download::RunInternal() {
     if (!canParallel && !singleMirrorOnly) {
         // Parallel mode is an explicit per-download choice. Never silently switch
         // this file to one mirror just because range checks or a transfer failed.
-        // In particular, do not discard durable chunks or the partial file when
+        // In particular, do not discard durable chunks or the .linkforge.part file when
         // mirrors are temporarily unavailable or cannot currently prove compatibility.
         {
             std::lock_guard lock(mutex);
-            lastError = L"Parallel mode was selected, but no compatible mirror currently supports HTTP byte ranges. The partial file and any saved chunk progress were kept. Check the mirrors and press Retry again, or explicitly create a new download if you want to start over.";
+            lastError = L"Parallel mode was selected, but no compatible mirror currently supports HTTP byte ranges. The .linkforge.part working file and any saved chunk progress were kept. Check the mirrors and press Retry again, or explicitly create a new download if you want to start over.";
         }
-        SetStatus(*this, DownloadPhase::Failed, L"No usable range mirror - partial data kept");
+        SetStatus(*this, DownloadPhase::Failed, L"No usable range mirror - working file kept");
         return;
     }
     if (!canParallel && singleMirrorOnly) {
@@ -2981,7 +2983,7 @@ void Download::RunInternal() {
             if (pausedAndWaiting || (workerPoolExitedForPause && !complete)) {
                 // Re-enter RunParallel with the same in-memory segment table.
                 // PrepareParallelFile explicitly preserves it and only verifies
-                // the partial file length, so completed chunks are not reset.
+                // the .linkforge.part working-file length, so completed chunks are not reset.
                 continue;
             }
 
@@ -3011,14 +3013,14 @@ void Download::RunInternal() {
                         : lastError;
                     lastError = failure;
                 }
-                // Keep the partial file and its per-chunk offsets so a user can add
+                // Keep the .linkforge.part working file and its per-chunk offsets so a user can add
                 // a usable mirror and Retry without discarding already completed work.
                 const bool sourceSizeChanged = failure.find(L"source file size changed") != std::wstring::npos;
-                const bool missingChunkMap = failure.find(L"non-empty partial file exists without a usable parallel chunk map") != std::wstring::npos;
+                const bool missingChunkMap = failure.find(L"non-empty .linkforge.part file exists without a usable parallel chunk map") != std::wstring::npos;
                 SetStatus(*this, DownloadPhase::Failed,
                           sourceSizeChanged ? L"Source size changed - parallel data kept"
-                                            : (missingChunkMap ? L"Chunk map missing - partial data kept"
-                                                               : L"Parallel stopped - partial data kept"));
+                                            : (missingChunkMap ? L"Chunk map missing - working file kept"
+                                                               : L"Parallel stopped - working file kept"));
                 return;
             }
             break;
@@ -3085,10 +3087,12 @@ void Download::RunInternal() {
             lastError = failure;
         }
 
-        const bool partialSequentialFailure =
-            failure.find(L"Partial sequential data was kept") == 0;
+        const bool workingFileNeedsDecision =
+            failure.find(L"Sequential data was kept in .linkforge.part") == 0 ||
+            failure.find(L"The existing .linkforge.part file contains data") == 0 ||
+            failure.find(L"The working .linkforge.part file became non-empty") == 0;
         SetStatus(*this, DownloadPhase::Failed,
-                  partialSequentialFailure ? L"Partial kept - Retry required"
+                  workingFileNeedsDecision ? L"Working file kept - Retry required"
                                             : L"Sequential mirrors exhausted");
     }
 }

@@ -154,7 +154,7 @@ public:
     Download& operator=(const Download&) = delete;
 
     void Start();
-    bool RequestCancel(bool keepPartial = false);
+    bool RequestCancel(bool keepWorkingFile = false);
     void RequestShutdown(); // stop I/O for process exit while preserving the working file
     void Pause();
     void Resume();
@@ -231,7 +231,7 @@ public:
     bool singleMirrorOnly = false; // explicit per-download mode; never silently downgrade parallel to sequential
     std::atomic<bool> cancelRequested{false};
     std::atomic<bool> shutdownRequested{false};
-    std::atomic<bool> keepPartialOnCancel{false};
+    std::atomic<bool> keepWorkingFileOnCancel{false};
     std::atomic<bool> stopProbeRequests{false};
 
 private:

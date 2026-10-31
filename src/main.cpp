@@ -469,7 +469,7 @@ void LoadDownloadsFromFile() {
         resume.referenceSuffixHash = _wcstoui64(ReadStateString(section.c_str(), L"ReferenceSuffixHash", g_downloadsStatePath).c_str(), nullptr, 10);
         resume.wasCompleted = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"Completed";
         resume.wasFailed = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"Failed";
-        // A crash can occur after the partial file was atomically renamed to its final
+        // A crash can occur after the .linkforge.part working file was atomically renamed to its final
         // name but before the next INI checkpoint. Recognize that completed file instead
         // of downloading it again under a new duplicate filename.
         if (!resume.wasCompleted && resume.sizeKnown && resume.totalSize > 0) {
