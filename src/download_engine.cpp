@@ -1481,7 +1481,8 @@ RetryResult Download::Retry(WorkingFileAction action, std::wstring& message) {
     }
 
     Join();
-    std::lock_guard lock(mutex);
+    {
+        std::lock_guard lock(mutex);
     if (phase != DownloadPhase::Failed && phase != DownloadPhase::Cancelled &&
         phase != DownloadPhase::CancelledKept) return RetryResult::NotRetryable;
     if (action == WorkingFileAction::Cancel) return RetryResult::NotRetryable;
@@ -1680,6 +1681,7 @@ RetryResult Download::Retry(WorkingFileAction action, std::wstring& message) {
         mirror->state = mirror->active ? L"Checking..." : L"Removed";
     }
 
+    }
     Start();
     return RetryResult::Started;
 }
