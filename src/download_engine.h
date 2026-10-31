@@ -56,6 +56,13 @@ enum class RetryResult {
     Failed
 };
 
+enum class WorkingFileAction {
+    Ask,
+    KeepAsUserPartial,
+    Delete,
+    Cancel
+};
+
 enum class ModeSwitchResult {
     Started,
     ConfirmationRequired,
@@ -105,8 +112,8 @@ struct Mirror {
 };
 
 struct DownloadResumeState {
+    // Only downloader-owned .linkforge.part paths may be restored.
     std::wstring partPath;
-    std::vector<std::wstring> preservedPartialPaths;
     bool sizeKnown = false;
     uint64_t totalSize = 0;
     uint64_t segmentBytes = 0;
@@ -121,8 +128,6 @@ struct DownloadResumeState {
     bool wasCancelled = false;
     bool wasCancelledKept = false;
     bool wasPaused = false;
-    bool resumeFallbackPending = false;
-    std::wstring resumeFallbackMirrorUrl;
 };
 
 struct Segment {
@@ -150,15 +155,15 @@ public:
 
     void Start();
     bool RequestCancel(bool keepPartial = false);
-    void RequestShutdown(); // stop I/O for process exit without cancelling or renaming the partial file
+    void RequestShutdown(); // stop I/O for process exit while preserving the working file
     void Pause();
     void Resume();
     bool IsPaused() const;
     bool IsRunning() const;
     void Join();
-    RetryResult Retry(bool confirmRestart, std::wstring& message);
-    ModeSwitchResult SwitchMode(bool targetSingleMirrorOnly, bool confirmed,
-                                bool keepExistingData, std::wstring& message);
+    RetryResult Retry(WorkingFileAction action, std::wstring& message);
+    ModeSwitchResult SwitchMode(bool targetSingleMirrorOnly, WorkingFileAction action,
+                                std::wstring& message);
     void AddMirrors(const std::vector<std::wstring>& urls);
     bool RemoveMirror(int mirrorId);
 
@@ -207,8 +212,6 @@ public:
     uint64_t referenceSuffixHash = 0;
     std::vector<uint64_t> restoredCompletedSegmentIndices;
     std::vector<std::pair<uint64_t, uint64_t>> restoredPartialSegmentBytes;
-    bool resumeFallbackPending = false;
-    std::wstring resumeFallbackMirrorUrl;
     bool initialProbeComplete = false;
     bool referenceReady = false;
     bool referenceSizeKnown = false;
@@ -230,9 +233,6 @@ public:
     std::atomic<bool> shutdownRequested{false};
     std::atomic<bool> keepPartialOnCancel{false};
     std::atomic<bool> stopProbeRequests{false};
-    bool partialKept = false;
-    std::wstring partialPath;
-    std::vector<std::wstring> preservedPartialPaths;
 
 private:
     void Run();
@@ -243,7 +243,6 @@ private:
     bool FinalizeFile(std::wstring& error);
     bool CleanupPartFile(std::wstring& error);
     void ClearResumeDataLocked(); // caller holds mutex
-    void PreservePartialFile();
     void FinishCancelled();
     void ProbeInitialMirrors();
     void ProbeOne(const std::shared_ptr<Mirror>& mirror);

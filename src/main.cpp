@@ -256,37 +256,6 @@ bool WriteStateString(const std::wstring& file, const wchar_t* section,
     return WritePrivateProfileStringW(section, key.c_str(), value.c_str(), file.c_str()) != FALSE;
 }
 
-bool DeleteFileIfPresent(const std::wstring& path, DWORD& errorCode) {
-    if (path.empty()) return true;
-
-    // Check first so paths that the user already removed are treated as completed.
-    // Keep the error output for access-denied, sharing violations, and other real failures.
-    DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        errorCode = GetLastError();
-        return errorCode == ERROR_FILE_NOT_FOUND || errorCode == ERROR_PATH_NOT_FOUND;
-    }
-    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-        errorCode = ERROR_ACCESS_DENIED;
-        return false;
-    }
-
-    if (DeleteFileW(path.c_str())) return true;
-    const DWORD deleteError = GetLastError();
-
-    // The file may have disappeared after the first check (for example, another
-    // cleanup operation or Explorer removed it). Recheck before reporting failure.
-    attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        const DWORD inspectError = GetLastError();
-        if (inspectError == ERROR_FILE_NOT_FOUND || inspectError == ERROR_PATH_NOT_FOUND)
-            return true;
-    }
-
-    errorCode = deleteError;
-    return false;
-}
-
 std::vector<uint64_t> ParseIndexList(const std::wstring& text) {
     std::vector<uint64_t> result;
     size_t start = 0;
@@ -349,12 +318,11 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         std::vector<std::wstring> urls;
         std::vector<uint64_t> completedSegments;
         std::vector<std::pair<uint64_t, uint64_t>> partialSegments;
-        std::vector<std::wstring> preservedPartialPaths;
-        std::wstring folder, filename, finalPath, partPath, phaseName, fallbackMirror;
-        uint64_t totalSize = 0, segmentBytes = 0, fallbackBytes = 0;
+        std::wstring folder, filename, finalPath, partPath, phaseName;
+        uint64_t totalSize = 0, segmentBytes = 0;
         uint64_t prefixHash = 0, middleHash = 0, suffixHash = 0;
         bool sizeKnown = false, userPaused = false, completed = false, failed = false, cancelled = false;
-        bool cancelledKept = false, resumeFallback = false, autoResume = false;
+        bool cancelledKept = false, autoResume = false;
         bool singleMirrorOnly = false;
         {
             std::lock_guard lock(download->mutex);
@@ -362,10 +330,8 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
             filename = download->fileName;
             finalPath = download->finalPath;
             partPath = download->partPath;
-            preservedPartialPaths = download->preservedPartialPaths;
             totalSize = download->totalSize;
             sizeKnown = download->sizeKnown;
-            fallbackBytes = download->fallbackBytes;
             segmentBytes = download->persistentSegmentBytes ? download->persistentSegmentBytes : download->restoredSegmentBytes;
             prefixHash = download->referencePrefixHash ? download->referencePrefixHash : download->restoredReferencePrefixHash;
             middleHash = download->referenceMiddleHash ? download->referenceMiddleHash : download->restoredReferenceMiddleHash;
@@ -373,10 +339,10 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
             userPaused = download->userPaused && !download->terminal;
             completed = download->phase == DownloadPhase::Completed;
             failed = download->phase == DownloadPhase::Failed;
-            cancelled = download->phase == DownloadPhase::Cancelled;
             cancelledKept = download->phase == DownloadPhase::CancelledKept;
-            resumeFallback = download->resumeFallbackPending;
-            fallbackMirror = download->resumeFallbackMirrorUrl;
+            const bool cancelPending = download->cancelRequested.load() &&
+                                       !download->shutdownRequested.load() && !cancelledKept;
+            cancelled = download->phase == DownloadPhase::Cancelled || cancelPending;
             singleMirrorOnly = download->singleMirrorOnly;
             for (const auto& mirror : download->mirrors) if (mirror->active) urls.push_back(mirror->url);
             if (!download->segments.empty()) {
@@ -391,8 +357,8 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
             }
             if (completed) phaseName = L"Completed";
             else if (failed) phaseName = L"Failed";
-            else if (cancelled) phaseName = L"Cancelled";
             else if (cancelledKept) phaseName = L"CancelledKept";
+            else if (cancelled) phaseName = L"Cancelled";
             else if (userPaused || download->phase == DownloadPhase::Paused) phaseName = L"Paused";
             else phaseName = L"Active";
             autoResume = !urls.empty() && !completed && !failed && !cancelled && !userPaused && !cancelledKept;
@@ -404,12 +370,9 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         ok &= WriteStateString(tempPath, section.c_str(), L"Folder", folder);
         ok &= WriteStateString(tempPath, section.c_str(), L"FileName", filename);
         ok &= WriteStateString(tempPath, section.c_str(), L"FinalPath", finalPath);
+        // PartPath is the active .linkforge.part working file only. Recovery
+        // .partial files are never written to or restored from queue state.
         ok &= WriteStateString(tempPath, section.c_str(), L"PartPath", partPath);
-        ok &= WriteStateString(tempPath, section.c_str(), L"PreservedPartialCount",
-                               std::to_wstring(preservedPartialPaths.size()));
-        for (size_t p = 0; p < preservedPartialPaths.size(); ++p)
-            ok &= WriteStateString(tempPath, section.c_str(), L"PreservedPartial" + std::to_wstring(p),
-                                   preservedPartialPaths[p]);
         ok &= WriteStateString(tempPath, section.c_str(), L"Phase", phaseName);
         ok &= WriteStateString(tempPath, section.c_str(), L"SizeKnown", sizeKnown ? L"1" : L"0");
         ok &= WriteStateString(tempPath, section.c_str(), L"TotalSize", std::to_wstring(totalSize));
@@ -417,10 +380,7 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         ok &= WriteStateString(tempPath, section.c_str(), L"ReferencePrefixHash", std::to_wstring(prefixHash));
         ok &= WriteStateString(tempPath, section.c_str(), L"ReferenceMiddleHash", std::to_wstring(middleHash));
         ok &= WriteStateString(tempPath, section.c_str(), L"ReferenceSuffixHash", std::to_wstring(suffixHash));
-        ok &= WriteStateString(tempPath, section.c_str(), L"FallbackBytes", std::to_wstring(fallbackBytes));
         ok &= WriteStateString(tempPath, section.c_str(), L"SingleMirrorOnly", singleMirrorOnly ? L"1" : L"0");
-        ok &= WriteStateString(tempPath, section.c_str(), L"ResumeFallback", resumeFallback ? L"1" : L"0");
-        ok &= WriteStateString(tempPath, section.c_str(), L"ResumeFallbackMirror", fallbackMirror);
         ok &= WriteStateString(tempPath, section.c_str(), L"UserPaused", userPaused ? L"1" : L"0");
         ok &= WriteStateString(tempPath, section.c_str(), L"AutoResume", autoResume ? L"1" : L"0");
         ok &= WriteStateString(tempPath, section.c_str(), L"MirrorCount", std::to_wstring(urls.size()));
@@ -497,14 +457,9 @@ void LoadDownloadsFromFile() {
         // Preserve the queue item even when the user removed all its mirrors.
         // A replacement mirror can be added from the details window after restart.
         linkforge::DownloadResumeState resume;
+        // The constructor accepts this only when it ends in .linkforge.part.
+        // Legacy .partial paths are intentionally ignored and never touched.
         resume.partPath = ReadStateString(section.c_str(), L"PartPath", g_downloadsStatePath);
-        const int preservedCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(
-            section.c_str(), L"PreservedPartialCount", 0, g_downloadsStatePath.c_str())), 0, 10000);
-        for (int p = 0; p < preservedCount; ++p) {
-            const std::wstring preserved = ReadStateString(
-                section.c_str(), L"PreservedPartial" + std::to_wstring(p), g_downloadsStatePath);
-            if (!preserved.empty()) resume.preservedPartialPaths.push_back(preserved);
-        }
         resume.sizeKnown = GetPrivateProfileIntW(section.c_str(), L"SizeKnown", 0, g_downloadsStatePath.c_str()) != 0;
         resume.totalSize = _wcstoui64(ReadStateString(section.c_str(), L"TotalSize", g_downloadsStatePath).c_str(), nullptr, 10);
         resume.segmentBytes = _wcstoui64(ReadStateString(section.c_str(), L"SegmentBytes", g_downloadsStatePath).c_str(), nullptr, 10);
@@ -512,8 +467,6 @@ void LoadDownloadsFromFile() {
         resume.referencePrefixHash = _wcstoui64(ReadStateString(section.c_str(), L"ReferencePrefixHash", g_downloadsStatePath).c_str(), nullptr, 10);
         resume.referenceMiddleHash = _wcstoui64(ReadStateString(section.c_str(), L"ReferenceMiddleHash", g_downloadsStatePath).c_str(), nullptr, 10);
         resume.referenceSuffixHash = _wcstoui64(ReadStateString(section.c_str(), L"ReferenceSuffixHash", g_downloadsStatePath).c_str(), nullptr, 10);
-        resume.resumeFallbackPending = GetPrivateProfileIntW(section.c_str(), L"ResumeFallback", 0, g_downloadsStatePath.c_str()) != 0;
-        resume.resumeFallbackMirrorUrl = ReadStateString(section.c_str(), L"ResumeFallbackMirror", g_downloadsStatePath);
         resume.wasCompleted = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"Completed";
         resume.wasFailed = ReadStateString(section.c_str(), L"Phase", g_downloadsStatePath) == L"Failed";
         // A crash can occur after the partial file was atomically renamed to its final
@@ -532,24 +485,27 @@ void LoadDownloadsFromFile() {
         resume.wasPaused = GetPrivateProfileIntW(section.c_str(), L"UserPaused", 0, g_downloadsStatePath.c_str()) != 0 &&
             !resume.wasCompleted && !resume.wasFailed && !resume.wasCancelled && !resume.wasCancelledKept;
         const bool autoResume = GetPrivateProfileIntW(section.c_str(), L"AutoResume", 0, g_downloadsStatePath.c_str()) != 0;
-        const int chunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"CompletedChunkCount", 0,
-                                                                                  g_downloadsStatePath.c_str())), 0, 10000);
-        for (int c = 0; c < chunkCount; ++c) {
-            const auto chunk = ReadStateString(section.c_str(), L"CompletedChunk" + std::to_wstring(c), g_downloadsStatePath);
-            auto indices = ParseIndexList(chunk);
-            resume.completedSegmentIndices.insert(resume.completedSegmentIndices.end(), indices.begin(), indices.end());
-        }
-        const int partialChunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"PartialChunkCount", 0,
-                                                                                          g_downloadsStatePath.c_str())), 0, 10000);
-        for (int c = 0; c < partialChunkCount; ++c) {
-            const auto chunk = ReadStateString(section.c_str(), L"PartialChunk" + std::to_wstring(c), g_downloadsStatePath);
-            auto partials = ParsePartialSegmentList(chunk);
-            resume.partialSegmentBytes.insert(resume.partialSegmentBytes.end(), partials.begin(), partials.end());
+        if (!resume.wasCancelled && !resume.wasCancelledKept) {
+            const int chunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"CompletedChunkCount", 0,
+                                                                                      g_downloadsStatePath.c_str())), 0, 10000);
+            for (int c = 0; c < chunkCount; ++c) {
+                const auto chunk = ReadStateString(section.c_str(), L"CompletedChunk" + std::to_wstring(c), g_downloadsStatePath);
+                auto indices = ParseIndexList(chunk);
+                resume.completedSegmentIndices.insert(resume.completedSegmentIndices.end(), indices.begin(), indices.end());
+            }
+            const int partialChunkCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"PartialChunkCount", 0,
+                                                                                              g_downloadsStatePath.c_str())), 0, 10000);
+            for (int c = 0; c < partialChunkCount; ++c) {
+                const auto chunk = ReadStateString(section.c_str(), L"PartialChunk" + std::to_wstring(c), g_downloadsStatePath);
+                auto partials = ParsePartialSegmentList(chunk);
+                resume.partialSegmentBytes.insert(resume.partialSegmentBytes.end(), partials.begin(), partials.end());
+            }
         }
 
         auto download = std::make_shared<Download>(folder, filename, urls, &resume);
         g_downloads.push_back(download);
-        if (autoResume && !urls.empty() && !resume.wasCompleted && !resume.wasFailed && !resume.wasPaused)
+        if (autoResume && !urls.empty() && !resume.wasCompleted && !resume.wasFailed &&
+            !resume.wasCancelled && !resume.wasCancelledKept && !resume.wasPaused)
             g_autoResumeDownloads.push_back(download);
     }
 }
@@ -1525,13 +1481,16 @@ void RetryDownloadWithConfirmation(HWND owner, const std::shared_ptr<Download>& 
     }
 
     std::wstring message;
-    RetryResult result = download->Retry(false, message);
+    RetryResult result = download->Retry(WorkingFileAction::Ask, message);
     if (result == RetryResult::ConfirmationRequired) {
-        const int choice = MessageBoxW(owner, message.c_str(), L"Confirm download retry",
-                                       MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-        if (choice != IDYES) return;
+        const int choice = MessageBoxW(owner, message.c_str(), L"Restart download",
+                                       MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
+        if (choice == IDCANCEL) return;
+        const WorkingFileAction action = choice == IDYES
+            ? WorkingFileAction::KeepAsUserPartial
+            : WorkingFileAction::Delete;
         message.clear();
-        result = download->Retry(true, message);
+        result = download->Retry(action, message);
     }
 
     if (result == RetryResult::Failed) {
@@ -1556,13 +1515,16 @@ void SwitchDownloadModeWithConfirmation(HWND owner, const std::shared_ptr<Downlo
     }
 
     std::wstring message;
-    ModeSwitchResult result = download->SwitchMode(targetSingleMirrorOnly, false, false, message);
+    ModeSwitchResult result = download->SwitchMode(targetSingleMirrorOnly, WorkingFileAction::Ask, message);
     if (result == ModeSwitchResult::ConfirmationRequired) {
         const int choice = MessageBoxW(owner, message.c_str(), L"Switch download mode",
                                        MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
-        if (choice != IDYES && choice != IDNO) return;
+        if (choice == IDCANCEL) return;
+        const WorkingFileAction action = choice == IDYES
+            ? WorkingFileAction::KeepAsUserPartial
+            : WorkingFileAction::Delete;
         message.clear();
-        result = download->SwitchMode(targetSingleMirrorOnly, true, choice == IDYES, message);
+        result = download->SwitchMode(targetSingleMirrorOnly, action, message);
     }
 
     if (result == ModeSwitchResult::Failed || result == ModeSwitchResult::NotAvailable) {
@@ -2086,16 +2048,35 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             auto download = GetSelectedDownload();
             if (download) {
                 const int choice = MessageBoxW(hwnd,
-                    L"What should LinkForge do with the data already downloaded?\n\nYes: cancel and keep it as a .partial file.\nNo: cancel and delete the partial data.\nCancel: continue downloading.",
-                    L"Cancel download", MB_YESNOCANCEL | MB_ICONQUESTION);
+                    L"What should LinkForge do with the unfinished .linkforge.part file?\n\n"
+                    L"Yes: move it to a uniquely named .partial recovery file. LinkForge will forget it and never inspect or delete it again.\n"
+                    L"No: permanently delete the .linkforge.part file.\n"
+                    L"Cancel: continue downloading.",
+                    L"Cancel download", MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
                 if (choice == IDYES || choice == IDNO) {
                     if (!download->RequestCancel(choice == IDYES)) {
                         MessageBoxW(hwnd,
                             L"This download cannot be cancelled in its current state. Completed downloads must be removed through Remove entry.",
                             L"Cannot cancel download", MB_OK | MB_ICONINFORMATION);
                     } else {
+                        // Persist the cancellation intent before waiting. If the
+                        // process stops during the handoff/delete, startup will not
+                        // automatically resume this explicitly cancelled download.
                         PersistDownloadsToFile();
+                        download->Join();
+                        const bool saved = PersistDownloadsToFile();
                         UpdateMainList();
+
+                        std::wstring cancelError;
+                        {
+                            std::lock_guard lock(download->mutex);
+                            if (download->phase == DownloadPhase::Failed) cancelError = download->lastError;
+                        }
+                        if (!cancelError.empty())
+                            MessageBoxW(hwnd, cancelError.c_str(), L"Could not finish cancellation", MB_OK | MB_ICONERROR);
+                        else if (!saved)
+                            MessageBoxW(hwnd, L"The download was cancelled, but its final queue state could not be saved.",
+                                        L"Could not save download queue", MB_OK | MB_ICONWARNING);
                     }
                 }
             }
@@ -2116,52 +2097,56 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
                 std::lock_guard lock(download->mutex);
                 terminal = download->terminal;
                 completed = download->phase == DownloadPhase::Completed;
-                paused = download->userPaused || download->pauseRequested.load() || download->phase == DownloadPhase::Paused;
+                paused = download->userPaused || download->pauseRequested.load() ||
+                         download->phase == DownloadPhase::Paused;
             }
             if (!terminal && !paused) {
-                MessageBoxW(hwnd, L"Cancel or pause the download first. An active entry cannot be removed while it is writing to disk.",
+                MessageBoxW(hwnd, L"Pause or cancel the download first. An active entry cannot be removed while it is writing to disk.",
                             L"Download is active", MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
 
             // A completed download is only removed from the queue; its finished file is always kept.
-            bool deleteFiles = false;
+            bool deleteWorkingFile = false;
             if (!completed) {
-                const int confirm = MessageBoxW(hwnd,
-                    L"This download is incomplete. Remove its queue entry?\n\nYes: delete its partial/output files and resume data.\nNo: keep its partial/output files.\nCancel: leave the entry and files unchanged.",
-                    L"Remove incomplete download", MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
-                if (confirm != IDYES && confirm != IDNO) return 0;
-                deleteFiles = confirm == IDYES;
-            }
-            const bool keepFiles = !deleteFiles;
-            if (paused) download->RequestCancel(keepFiles);
-            download->Join();
-            if (deleteFiles) {
-                std::wstring finalPath, partPath, partialPath;
-                std::vector<std::wstring> preservedPartialPaths;
+                const int choice = MessageBoxW(hwnd,
+                    L"This download is incomplete. Remove its queue entry?\n\n"
+                    L"Yes: permanently delete its unfinished .linkforge.part working file.\n"
+                    L"No: move the unfinished data to a uniquely named .partial recovery file. LinkForge will forget it and never inspect or delete it again.\n"
+                    L"Cancel: leave the queue entry and working file unchanged.",
+                    L"Remove incomplete download", MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
+                if (choice != IDYES && choice != IDNO) return 0;
+                deleteWorkingFile = choice == IDYES;
+
+                if (!download->RequestCancel(!deleteWorkingFile)) {
+                    MessageBoxW(hwnd, L"Could not stop this download to remove its entry. No file was intentionally changed.",
+                                L"Could not remove download", MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+                download->Join();
+
+                std::wstring workingPath;
+                std::wstring operationError;
                 {
                     std::lock_guard lock(download->mutex);
-                    finalPath = download->finalPath;
-                    partPath = download->partPath;
-                    partialPath = download->partialPath;
-                    preservedPartialPaths = download->preservedPartialPaths;
+                    workingPath = download->partPath;
+                    if (download->phase == DownloadPhase::Failed) operationError = download->lastError;
                 }
-                std::vector<std::wstring> pathsToDelete = {
-                    finalPath, partPath, partialPath,
-                    finalPath + L".linkforge.part", finalPath + L".partial"
-                };
-                pathsToDelete.insert(pathsToDelete.end(), preservedPartialPaths.begin(), preservedPartialPaths.end());
-                std::sort(pathsToDelete.begin(), pathsToDelete.end());
-                pathsToDelete.erase(std::unique(pathsToDelete.begin(), pathsToDelete.end()), pathsToDelete.end());
-                for (const std::wstring& path : pathsToDelete) {
-                    DWORD deleteError = ERROR_SUCCESS;
-                    if (!DeleteFileIfPresent(path, deleteError)) {
-                        const std::wstring errorText = L"Could not delete this download file:\n" + path +
-                            L"\n\nWindows error: " + std::to_wstring(deleteError) +
-                            L"\nClose any program using the file, then try Remove entry again.";
-                        MessageBoxW(hwnd, errorText.c_str(), L"Could not remove download", MB_OK | MB_ICONERROR);
-                        return 0;
+
+                std::error_code fileError;
+                const bool workingFileRemains = !workingPath.empty() &&
+                    std::filesystem::exists(std::filesystem::path(workingPath), fileError);
+                if (fileError || workingFileRemains) {
+                    if (operationError.empty()) {
+                        operationError = fileError
+                            ? L"Could not verify the .linkforge.part working file after the requested action. Filesystem error: " +
+                                  std::to_wstring(fileError.value())
+                            : (deleteWorkingFile
+                                ? L"The .linkforge.part file still exists. It was not removed from the queue because deletion did not complete."
+                                : L"The .linkforge.part file is still present because it could not be moved to your .partial recovery file.");
                     }
+                    MessageBoxW(hwnd, operationError.c_str(), L"Could not remove download", MB_OK | MB_ICONERROR);
+                    return 0;
                 }
             }
 
@@ -2174,9 +2159,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (!PersistDownloadsToFile()) {
                 g_downloads.insert(g_downloads.begin() + std::min(index, static_cast<int>(g_downloads.size())), download);
                 g_lastProgressBytes.assign(g_downloads.size(), UINT64_MAX);
-                const std::wstring saveError = deleteFiles
-                    ? L"The download files were deleted, but the queue INI could not be updated. The entry has been kept so you can retry removal."
-                    : L"The download files were kept, but the queue INI could not be updated. The entry has been kept so you can retry removal.";
+                const std::wstring saveError = completed
+                    ? L"The completed output file was kept, but the queue INI could not be updated. The entry has been restored in the list."
+                    : L"The selected working-file action completed, but the queue INI could not be updated. The entry has been restored in the list. Any .partial recovery file is user-owned and is not tracked by LinkForge.";
                 MessageBoxW(hwnd, saveError.c_str(), L"Could not save download queue", MB_OK | MB_ICONERROR);
                 UpdateMainList();
                 return 0;
