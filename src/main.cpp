@@ -254,9 +254,33 @@ bool WriteStateString(const std::wstring& file, const wchar_t* section,
 
 bool DeleteFileIfPresent(const std::wstring& path, DWORD& errorCode) {
     if (path.empty()) return true;
+
+    // Check first so paths that the user already removed are treated as completed.
+    // Keep the error output for access-denied, sharing violations, and other real failures.
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        errorCode = GetLastError();
+        return errorCode == ERROR_FILE_NOT_FOUND || errorCode == ERROR_PATH_NOT_FOUND;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        errorCode = ERROR_ACCESS_DENIED;
+        return false;
+    }
+
     if (DeleteFileW(path.c_str())) return true;
-    errorCode = GetLastError();
-    return errorCode == ERROR_FILE_NOT_FOUND || errorCode == ERROR_PATH_NOT_FOUND;
+    const DWORD deleteError = GetLastError();
+
+    // The file may have disappeared after the first check (for example, another
+    // cleanup operation or Explorer removed it). Recheck before reporting failure.
+    attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const DWORD inspectError = GetLastError();
+        if (inspectError == ERROR_FILE_NOT_FOUND || inspectError == ERROR_PATH_NOT_FOUND)
+            return true;
+    }
+
+    errorCode = deleteError;
+    return false;
 }
 
 std::vector<uint64_t> ParseIndexList(const std::wstring& text) {
