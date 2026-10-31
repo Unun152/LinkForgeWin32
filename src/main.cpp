@@ -36,6 +36,7 @@ namespace {
 constexpr wchar_t kMainClass[] = L"LinkForgeMainWindow";
 constexpr wchar_t kTextDialogClass[] = L"LinkForgeTextDialog";
 constexpr wchar_t kDetailsClass[] = L"LinkForgeDetailsWindow";
+constexpr wchar_t kStatusDetailsClass[] = L"LinkForgeStatusDetailsWindow";
 constexpr wchar_t kSettingsClass[] = L"LinkForgeSettingsWindow";
 constexpr UINT_PTR kUiTimer = 1;
 
@@ -63,6 +64,8 @@ constexpr int ID_DETAIL_REMOVE = 3003;
 constexpr int ID_DETAIL_CLOSE = 3004;
 constexpr int ID_DETAIL_RETRY = 3005;
 constexpr int ID_DETAIL_SWITCH_MODE = 3006;
+constexpr int ID_DETAIL_STATUS_DETAILS = 3007;
+constexpr int ID_STATUS_DETAILS_CLOSE = 5001;
 
 constexpr int ID_SETTINGS_MAX_TOTAL = 4001;
 constexpr int ID_SETTINGS_MAX_PER_MIRROR = 4002;
@@ -136,12 +139,18 @@ struct DetailsContext {
     HWND list = nullptr;
     HWND tooltip = nullptr;
     std::wstring tooltipText;
-    std::wstring summaryTooltipText;
     HWND addButton = nullptr;
     HWND removeButton = nullptr;
     HWND retryButton = nullptr;
     HWND switchModeButton = nullptr;
+    HWND statusDetailsButton = nullptr;
     HWND closeButton = nullptr;
+};
+
+struct StatusDetailsContext {
+    HWND edit = nullptr;
+    HWND closeButton = nullptr;
+    std::wstring details;
 };
 
 struct SettingsContext {
@@ -1589,7 +1598,6 @@ void RefreshDetails(DetailsContext* context) {
     std::shared_ptr<Download> download = context->download;
     std::vector<std::shared_ptr<Mirror>> mirrors;
     std::wstring summary;
-    std::wstring summaryTooltip;
     bool terminal = false;
     bool canRetry = false;
     bool canSwitchMode = false;
@@ -1604,12 +1612,6 @@ void RefreshDetails(DetailsContext* context) {
         const std::wstring average = averageSpeedBps >= 1.0 ? FormatSpeed(averageSpeedBps) : L"—";
         const uint64_t chunkBytes = download->persistentSegmentBytes ? download->persistentSegmentBytes : download->restoredSegmentBytes;
         const std::wstring chunkSizeText = chunkBytes ? FormatBytes(chunkBytes) : L"not set";
-        std::wstring shortStatus = GetDownloadStatusTextLocked(*download);
-        // The selected mode is already shown on the first summary row.
-        if (shortStatus == L"Downloading (parallel)" ||
-            shortStatus == L"Downloading (sequential)") {
-            shortStatus.clear();
-        }
         const std::wstring summaryFirstRow =
             L"Mirrors: " + std::to_wstring(download->activeRequests) + L"/" + std::to_wstring(download->mirrors.size()) +
             L"   ·   " + (download->singleMirrorOnly ? L"Mode: Single mirror" : L"Mode: Parallel") +
@@ -1617,17 +1619,14 @@ void RefreshDetails(DetailsContext* context) {
             L"   ·   Chunks: " + std::to_wstring(download->completedSegments) + L"/" + std::to_wstring(download->segments.size()) + L" complete";
         const std::wstring summarySecondRow =
             L"Progress: " + GetProgressTextLocked(*download) + L" (" + GetSizeTextLocked(*download) + L")" +
-            L"   ·   Current: " + FormatSpeed(download->speedBps) + L"   ·   Avg: " + average +
-            (shortStatus.empty() ? std::wstring() : L"   ·   Status: " + shortStatus);
+            L"   ·   Current: " + FormatSpeed(download->speedBps) + L"   ·   Avg: " + average;
         summary = summaryFirstRow + L"\r\n" + summarySecondRow;
-        summaryTooltip = summary + L"\r\n\r\n" + GetDownloadStatusTooltipLocked(*download);
         terminal = download->terminal;
         canRetry = download->phase == DownloadPhase::Failed || download->phase == DownloadPhase::Cancelled ||
                    download->phase == DownloadPhase::CancelledKept;
         canSwitchMode = canRetry;
         singleMirrorOnly = download->singleMirrorOnly;
     }
-    context->summaryTooltipText = std::move(summaryTooltip);
     SetWindowTextW(context->summaryLabel, summary.c_str());
     const auto currentSettings = linkforge::GetSettings();
     EnableWindow(context->addButton, !terminal || canRetry);
@@ -2090,6 +2089,111 @@ void RemoveSelectedMirror(DetailsContext* context) {
     RefreshDetails(context);
 }
 
+LRESULT CALLBACK StatusDetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* context = reinterpret_cast<StatusDetailsContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        context = static_cast<StatusDetailsContext*>(create->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
+    }
+
+    switch (message) {
+    case WM_CREATE: {
+        if (!context) return -1;
+        context->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", context->details.c_str(),
+                                        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
+                                        ES_AUTOVSCROLL | ES_READONLY | ES_NOHIDESEL,
+                                        16, 16, 680, 300, hwnd, nullptr, g_instance, nullptr);
+        SetFont(context->edit);
+        context->closeButton = CreateDarkButton(hwnd, L"Close", ID_STATUS_DETAILS_CLOSE,
+                                                0, 0, 120, 34);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        MoveWindow(context->closeButton, client.right - 138, client.bottom - 50, 120, 34, TRUE);
+        return 0;
+    }
+    case WM_GETMINMAXINFO: {
+        auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+        limits->ptMinTrackSize.x = 560;
+        limits->ptMinTrackSize.y = 260;
+        return 0;
+    }
+    case WM_SIZE: {
+        if (!context || !context->edit) break;
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        MoveWindow(context->edit, 16, 16, client.right - 32, client.bottom - 78, TRUE);
+        MoveWindow(context->closeButton, client.right - 138, client.bottom - 50, 120, 34, TRUE);
+        break;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == ID_STATUS_DETAILS_CLOSE) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_DRAWITEM:
+        if (reinterpret_cast<DRAWITEMSTRUCT*>(lParam)->CtlType == ODT_BUTTON) {
+            DrawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+            return TRUE;
+        }
+        break;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, kText);
+        SetBkColor(dc, kWindowBg);
+        SetBkMode(dc, TRANSPARENT);
+        return reinterpret_cast<LRESULT>(g_windowBrush);
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, kText);
+        SetBkColor(dc, kInputBg);
+        return reinterpret_cast<LRESULT>(g_inputBrush);
+    }
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, g_windowBrush);
+        return 1;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_NCDESTROY:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        delete context;
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void OpenStatusDetails(HWND owner, const std::shared_ptr<Download>& download) {
+    if (!download) return;
+
+    auto* context = new StatusDetailsContext();
+    std::wstring title = L"Download status details";
+    {
+        std::lock_guard lock(download->mutex);
+        context->details = GetDownloadStatusTooltipLocked(*download);
+        if (!download->fileName.empty()) title += L" — " + download->fileName;
+    }
+
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kStatusDetailsClass, title.c_str(),
+                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 760, 420,
+                                owner, nullptr, g_instance, context);
+    if (!hwnd) {
+        delete context;
+        return;
+    }
+
+    CenterOver(hwnd, owner);
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+}
+
 LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     auto* context = reinterpret_cast<DetailsContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (message == WM_NCCREATE) {
@@ -2125,11 +2229,12 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         AddColumn(context->list, 5, L"Mode / connections", 105);
         AddColumn(context->list, 6, L"Status / error", 140);
         AddColumn(context->list, 7, L"Chunks done / active / failed", 150);
-        context->tooltip = CreateListCellTooltip(hwnd, context->list, context->summaryLabel);
+        context->tooltip = CreateListCellTooltip(hwnd, context->list);
         context->addButton = CreateDarkButton(hwnd, L"＋ Add mirrors", ID_DETAIL_ADD, 18, 490, 138, 34);
         context->removeButton = CreateDarkButton(hwnd, L"Remove mirror", ID_DETAIL_REMOVE, 164, 490, 130, 34);
         context->retryButton = CreateDarkButton(hwnd, L"Retry download", ID_DETAIL_RETRY, 302, 490, 130, 34);
         context->switchModeButton = CreateDarkButton(hwnd, L"Switch mode", ID_DETAIL_SWITCH_MODE, 440, 490, 158, 34);
+        context->statusDetailsButton = CreateDarkButton(hwnd, L"Status details", ID_DETAIL_STATUS_DETAILS, 610, 490, 148, 34);
         context->closeButton = CreateDarkButton(hwnd, L"Close", ID_DETAIL_CLOSE, 916, 490, 130, 34);
         RefreshDetails(context);
         SetTimer(hwnd, kUiTimer, 500, nullptr);
@@ -2154,6 +2259,7 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         MoveWindow(context->removeButton, 164, height - 58, 130, 34, TRUE);
         MoveWindow(context->retryButton, 302, height - 58, 130, 34, TRUE);
         MoveWindow(context->switchModeButton, 440, height - 58, 158, 34, TRUE);
+        MoveWindow(context->statusDetailsButton, 610, height - 58, 148, 34, TRUE);
         MoveWindow(context->closeButton, width - 148, height - 58, 130, 34, TRUE);
         break;
     }
@@ -2184,6 +2290,9 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             SwitchDownloadModeWithConfirmation(hwnd, context->download);
             RefreshDetails(context);
             return 0;
+        case ID_DETAIL_STATUS_DETAILS:
+            OpenStatusDetails(hwnd, context->download);
+            return 0;
         case ID_DETAIL_CLOSE:
             DestroyWindow(hwnd);
             return 0;
@@ -2193,8 +2302,7 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_NOTIFY: {
         auto* header = reinterpret_cast<NMHDR*>(lParam);
         if (context && HandleListCellTooltip(context->tooltip, context->list, 6,
-                                             context->summaryLabel, context->tooltipText, lParam,
-                                             &context->summaryTooltipText))
+                                             nullptr, context->tooltipText, lParam))
             return 0;
         if (header && header->hwndFrom == context->list && header->code == NM_CUSTOMDRAW) {
             return HandleListCustomDraw(context->list, lParam, false);
@@ -2863,6 +2971,16 @@ bool RegisterClasses() {
     detailClass.hbrBackground = g_windowBrush;
     detailClass.lpszClassName = kDetailsClass;
     if (!RegisterClassExW(&detailClass)) return false;
+
+    WNDCLASSEXW statusDetailsClass{};
+    statusDetailsClass.cbSize = sizeof(statusDetailsClass);
+    statusDetailsClass.style = CS_HREDRAW | CS_VREDRAW;
+    statusDetailsClass.lpfnWndProc = StatusDetailsProc;
+    statusDetailsClass.hInstance = g_instance;
+    statusDetailsClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    statusDetailsClass.hbrBackground = g_windowBrush;
+    statusDetailsClass.lpszClassName = kStatusDetailsClass;
+    if (!RegisterClassExW(&statusDetailsClass)) return false;
 
     WNDCLASSEXW settingsClass{};
     settingsClass.cbSize = sizeof(settingsClass);
