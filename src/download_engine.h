@@ -104,6 +104,8 @@ struct Mirror {
     double speedBps = 0.0;
     std::wstring etag;
     std::wstring lastModified;
+    std::wstring representationSha256Hex;
+    std::wstring representationSha512Hex;
     std::wstring state = L"Checking...";
     std::wstring lastError;
     std::vector<unsigned char> prefixSample;
@@ -128,9 +130,16 @@ struct DownloadResumeState {
     bool wasCancelled = false;
     bool wasCancelledKept = false;
     bool wasPaused = false;
-    // Preserve the last useful failure state and diagnostic across application restarts.
+    // Preserve failure diagnostics and integrity results across application restarts.
     std::wstring statusText;
     std::wstring lastError;
+    std::wstring expectedSha256Hex;
+    std::wstring expectedSha512Hex;
+    std::wstring computedSha256Hex;
+    std::wstring computedSha512Hex;
+    std::wstring integrityStatusText;
+    std::wstring integrityDigestSource;
+    std::wstring integrityDigestSourceUrl;
 };
 
 struct Segment {
@@ -184,6 +193,14 @@ public:
     std::wstring partPath;
     std::wstring statusText = L"Queued";
     std::wstring lastError;
+    // Server-advertised full-representation hashes and local file hashes.
+    std::wstring expectedSha256Hex;
+    std::wstring expectedSha512Hex;
+    std::wstring computedSha256Hex;
+    std::wstring computedSha512Hex;
+    std::wstring integrityStatusText;
+    std::wstring integrityDigestSource;
+    std::wstring integrityDigestSourceUrl;
     DownloadPhase phase = DownloadPhase::Queued;
 
     bool sizeKnown = false;

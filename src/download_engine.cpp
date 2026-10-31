@@ -13,6 +13,7 @@
 #include <sstream>
 #include <utility>
 #include <winioctl.h>
+#include <bcrypt.h>
 
 namespace linkforge {
 namespace {
@@ -104,6 +105,8 @@ struct ProbeResult {
     bool rangeCapable = false;
     std::wstring etag;
     std::wstring lastModified;
+    std::wstring representationSha256Hex;
+    std::wstring representationSha512Hex;
     std::wstring suggestedFileName;
     std::vector<unsigned char> prefix;
     std::vector<unsigned char> middle;
@@ -120,6 +123,291 @@ uint64_t HashSample(const std::vector<unsigned char>& bytes) {
     }
     return hash;
 }
+
+struct HttpDigestValues {
+    std::wstring sha256Hex;
+    std::wstring sha512Hex;
+};
+
+int Base64Value(wchar_t value) {
+    if (value >= L'A' && value <= L'Z') return static_cast<int>(value - L'A');
+    if (value >= L'a' && value <= L'z') return static_cast<int>(value - L'a') + 26;
+    if (value >= L'0' && value <= L'9') return static_cast<int>(value - L'0') + 52;
+    if (value == L'+') return 62;
+    if (value == L'/') return 63;
+    return -1;
+}
+
+bool DecodeDigestBase64(const std::wstring& encoded, size_t expectedBytes,
+                        std::wstring& hexOutput) {
+    if (encoded.empty() || encoded.size() % 4 != 0) return false;
+    std::vector<unsigned char> decoded;
+    decoded.reserve((encoded.size() / 4) * 3);
+
+    for (size_t index = 0; index < encoded.size(); index += 4) {
+        const bool finalBlock = index + 4 == encoded.size();
+        const int a = Base64Value(encoded[index]);
+        const int b = Base64Value(encoded[index + 1]);
+        const bool pad2 = encoded[index + 2] == L'=';
+        const bool pad3 = encoded[index + 3] == L'=';
+        const int c = pad2 ? 0 : Base64Value(encoded[index + 2]);
+        const int d = pad3 ? 0 : Base64Value(encoded[index + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0 ||
+            (!finalBlock && (pad2 || pad3)) || (pad2 && !pad3)) return false;
+
+        const uint32_t value = (static_cast<uint32_t>(a) << 18) |
+                               (static_cast<uint32_t>(b) << 12) |
+                               (static_cast<uint32_t>(c) << 6) |
+                               static_cast<uint32_t>(d);
+        decoded.push_back(static_cast<unsigned char>((value >> 16) & 0xff));
+        if (!pad2) decoded.push_back(static_cast<unsigned char>((value >> 8) & 0xff));
+        if (!pad3) decoded.push_back(static_cast<unsigned char>(value & 0xff));
+    }
+    if (decoded.size() != expectedBytes) return false;
+
+    static constexpr wchar_t hexDigits[] = L"0123456789abcdef";
+    hexOutput.clear();
+    hexOutput.reserve(decoded.size() * 2);
+    for (const unsigned char byte : decoded) {
+        hexOutput.push_back(hexDigits[(byte >> 4) & 0xf]);
+        hexOutput.push_back(hexDigits[byte & 0xf]);
+    }
+    return true;
+}
+
+bool ExtractStructuredDigest(const std::wstring& header, const wchar_t* algorithm,
+                             size_t digestBytes, std::wstring& hexOutput) {
+    std::wstring lower = header;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](wchar_t character) { return static_cast<wchar_t>(towlower(character)); });
+    const std::wstring key = algorithm;
+    size_t position = 0;
+    while ((position = lower.find(key, position)) != std::wstring::npos) {
+        const bool tokenStart = position == 0 || lower[position - 1] == L',' ||
+                                iswspace(lower[position - 1]);
+        size_t cursor = position + key.size();
+        if (!tokenStart) {
+            position = cursor;
+            continue;
+        }
+        while (cursor < lower.size() && iswspace(lower[cursor])) ++cursor;
+        if (cursor >= lower.size() || lower[cursor] != L'=') {
+            position = cursor;
+            continue;
+        }
+        ++cursor;
+        while (cursor < lower.size() && iswspace(lower[cursor])) ++cursor;
+        if (cursor >= lower.size() || lower[cursor] != L':') {
+            position = cursor;
+            continue;
+        }
+        const size_t end = header.find(L':', cursor + 1);
+        if (end == std::wstring::npos) return false;
+        if (DecodeDigestBase64(header.substr(cursor + 1, end - cursor - 1),
+                               digestBytes, hexOutput)) return true;
+        position = end + 1;
+    }
+    return false;
+}
+
+HttpDigestValues ParseHttpDigestValues(const std::wstring& header) {
+    HttpDigestValues result;
+    // RFC 9530 Structured Field byte sequences. SHA-256 and SHA-512 are the
+    // active HTTP digest algorithms; deprecated MD5/SHA-1 values are ignored.
+    ExtractStructuredDigest(header, L"sha-256", 32, result.sha256Hex);
+    ExtractStructuredDigest(header, L"sha-512", 64, result.sha512Hex);
+    return result;
+}
+
+bool MergeProbeDigestValues(HttpDigestValues& current, const HttpDigestValues& incoming,
+                            std::wstring& error) {
+    if (!current.sha256Hex.empty() && !incoming.sha256Hex.empty() &&
+        current.sha256Hex != incoming.sha256Hex) {
+        error = L"The mirror returned conflicting SHA-256 Repr-Digest values during its range checks.";
+        return false;
+    }
+    if (!current.sha512Hex.empty() && !incoming.sha512Hex.empty() &&
+        current.sha512Hex != incoming.sha512Hex) {
+        error = L"The mirror returned conflicting SHA-512 Repr-Digest values during its range checks.";
+        return false;
+    }
+    if (current.sha256Hex.empty()) current.sha256Hex = incoming.sha256Hex;
+    if (current.sha512Hex.empty()) current.sha512Hex = incoming.sha512Hex;
+    return true;
+}
+
+bool AcceptResponseDigestLocked(Download& download, Mirror& mirror,
+                                const HttpDigestValues& incoming,
+                                const wchar_t* sourceHeader, std::wstring& error) {
+    if (!incoming.sha256Hex.empty()) {
+        if ((!download.expectedSha256Hex.empty() &&
+             download.expectedSha256Hex != incoming.sha256Hex) ||
+            (!mirror.representationSha256Hex.empty() &&
+             mirror.representationSha256Hex != incoming.sha256Hex)) {
+            error = L"The server's SHA-256 representation digest changed during the download. "
+                    L"The existing working file and saved chunk progress were kept.";
+            return false;
+        }
+        if (download.expectedSha256Hex.empty()) download.expectedSha256Hex = incoming.sha256Hex;
+        if (mirror.representationSha256Hex.empty()) mirror.representationSha256Hex = incoming.sha256Hex;
+    }
+    if (!incoming.sha512Hex.empty()) {
+        if ((!download.expectedSha512Hex.empty() &&
+             download.expectedSha512Hex != incoming.sha512Hex) ||
+            (!mirror.representationSha512Hex.empty() &&
+             mirror.representationSha512Hex != incoming.sha512Hex)) {
+            error = L"The server's SHA-512 representation digest changed during the download. "
+                    L"The existing working file and saved chunk progress were kept.";
+            return false;
+        }
+        if (download.expectedSha512Hex.empty()) download.expectedSha512Hex = incoming.sha512Hex;
+        if (mirror.representationSha512Hex.empty()) mirror.representationSha512Hex = incoming.sha512Hex;
+    }
+    if (download.integrityDigestSource.empty() &&
+        (!incoming.sha256Hex.empty() || !incoming.sha512Hex.empty())) {
+        download.integrityDigestSource = sourceHeader;
+        download.integrityDigestSourceUrl = mirror.url;
+    }
+    return true;
+}
+
+class CngStreamingHash {
+public:
+    CngStreamingHash() = default;
+    ~CngStreamingHash() {
+        if (hash) BCryptDestroyHash(hash);
+        if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    }
+    CngStreamingHash(const CngStreamingHash&) = delete;
+    CngStreamingHash& operator=(const CngStreamingHash&) = delete;
+
+    bool Initialize(LPCWSTR algorithmId, std::wstring& error) {
+        NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, algorithmId, nullptr, 0);
+        if (status < 0) {
+            error = L"BCryptOpenAlgorithmProvider failed: " +
+                    std::to_wstring(static_cast<unsigned long>(status));
+            return false;
+        }
+        ULONG objectLength = 0;
+        ULONG bytesReturned = 0;
+        status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+                                   reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+                                   &bytesReturned, 0);
+        if (status < 0 || objectLength == 0) {
+            error = L"Could not query the Windows CNG hash-object size: " +
+                    std::to_wstring(static_cast<unsigned long>(status));
+            return false;
+        }
+        object.resize(objectLength);
+        status = BCryptCreateHash(algorithm, &hash, object.data(), objectLength,
+                                  nullptr, 0, 0);
+        if (status < 0) {
+            error = L"BCryptCreateHash failed: " +
+                    std::to_wstring(static_cast<unsigned long>(status));
+            return false;
+        }
+        return true;
+    }
+
+    bool Update(const unsigned char* data, ULONG length, std::wstring& error) {
+        if (!hash || length == 0) return true;
+        const NTSTATUS status = BCryptHashData(hash, const_cast<PUCHAR>(data), length, 0);
+        if (status < 0) {
+            error = L"BCryptHashData failed: " +
+                    std::to_wstring(static_cast<unsigned long>(status));
+            return false;
+        }
+        return true;
+    }
+
+    bool Finish(std::vector<unsigned char>& output, ULONG length, std::wstring& error) {
+        output.resize(length);
+        const NTSTATUS status = BCryptFinishHash(hash, output.data(), length, 0);
+        if (status < 0) {
+            output.clear();
+            error = L"BCryptFinishHash failed: " +
+                    std::to_wstring(static_cast<unsigned long>(status));
+            return false;
+        }
+        return true;
+    }
+
+private:
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    std::vector<unsigned char> object;
+};
+
+std::wstring BytesToHex(const std::vector<unsigned char>& bytes) {
+    static constexpr wchar_t digits[] = L"0123456789abcdef";
+    std::wstring result;
+    result.reserve(bytes.size() * 2);
+    for (const unsigned char byte : bytes) {
+        result.push_back(digits[(byte >> 4) & 0xf]);
+        result.push_back(digits[byte & 0xf]);
+    }
+    return result;
+}
+
+bool ComputeFileDigests(const std::wstring& path, bool calculateSha512,
+                        std::wstring& sha256Hex, std::wstring& sha512Hex,
+                        uint64_t& fileSize, std::wstring& error) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = L"Could not open the completed working file for checksum calculation: " +
+                std::to_wstring(GetLastError());
+        return false;
+    }
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0) {
+        error = L"Could not read the completed working-file size for checksum calculation: " +
+                std::to_wstring(GetLastError());
+        CloseHandle(file);
+        return false;
+    }
+    fileSize = static_cast<uint64_t>(size.QuadPart);
+
+    CngStreamingHash sha256;
+    CngStreamingHash sha512;
+    if (!sha256.Initialize(BCRYPT_SHA256_ALGORITHM, error) ||
+        (calculateSha512 && !sha512.Initialize(BCRYPT_SHA512_ALGORITHM, error))) {
+        CloseHandle(file);
+        return false;
+    }
+
+    std::vector<unsigned char> buffer(1024 * 1024);
+    for (;;) {
+        DWORD received = 0;
+        if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &received, nullptr)) {
+            error = L"Could not read the completed working file for checksum calculation: " +
+                    std::to_wstring(GetLastError());
+            CloseHandle(file);
+            return false;
+        }
+        if (received == 0) break;
+        if (!sha256.Update(buffer.data(), received, error) ||
+            (calculateSha512 && !sha512.Update(buffer.data(), received, error))) {
+            CloseHandle(file);
+            return false;
+        }
+    }
+    CloseHandle(file);
+
+    std::vector<unsigned char> sha256Bytes;
+    if (!sha256.Finish(sha256Bytes, 32, error)) return false;
+    sha256Hex = BytesToHex(sha256Bytes);
+
+    if (calculateSha512) {
+        std::vector<unsigned char> sha512Bytes;
+        if (!sha512.Finish(sha512Bytes, 64, error)) return false;
+        sha512Hex = BytesToHex(sha512Bytes);
+    }
+    return true;
+}
+
 
 struct RangeResult {
     bool ok = false;
@@ -182,7 +470,8 @@ std::unique_ptr<HttpHandles> StartRequest(const std::wstring& url,
                                           const wchar_t* method,
                                           const std::wstring& headers,
                                           DWORD& status,
-                                          std::wstring& error) {
+                                          std::wstring& error,
+                                          bool requestDigestHints = true) {
     status = 0;
     ParsedUrl parsed;
     if (!CrackUrl(url, parsed, error)) return {};
@@ -206,6 +495,11 @@ std::unique_ptr<HttpHandles> StartRequest(const std::wstring& url,
         return {};
     }
     std::wstring requestHeaders = headers;
+    // RFC 9530 preferences are hints; never make them a requirement for downloading.
+    if (requestDigestHints) {
+        requestHeaders += L"Want-Repr-Digest: sha-512=3, sha-256=10\r\n";
+        requestHeaders += L"Want-Content-Digest: sha-512=3, sha-256=10\r\n";
+    }
     const DownloaderSettings settings = GetSettings();
     if (settings.sendUserAgent && !settings.userAgent.empty()) {
         std::wstring safeAgent = settings.userAgent;
@@ -234,6 +528,13 @@ std::unique_ptr<HttpHandles> StartRequest(const std::wstring& url,
                              WINHTTP_NO_HEADER_INDEX)) {
         error = L"Could not read HTTP status: " + std::to_wstring(GetLastError());
         return {};
+    }
+    // Some older servers reject unknown preference headers. Retry without them
+    // rather than making digest support a download requirement.
+    if (requestDigestHints && (status == 400 || status == 406)) {
+        handles.reset();
+        error.clear();
+        return StartRequest(url, method, headers, status, error, false);
     }
     return handles;
 }
@@ -418,6 +719,10 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         }
         result.etag = QueryHeader(head->request, WINHTTP_QUERY_ETAG);
         result.lastModified = QueryHeader(head->request, WINHTTP_QUERY_LAST_MODIFIED);
+        const HttpDigestValues headDigests = ParseHttpDigestValues(
+            QueryCustomHeader(head->request, L"Repr-Digest"));
+        result.representationSha256Hex = headDigests.sha256Hex;
+        result.representationSha512Hex = headDigests.sha512Hex;
         result.suggestedFileName = ParseContentDispositionFilename(
             QueryCustomHeader(head->request, L"Content-Disposition"));
     }
@@ -440,6 +745,14 @@ ProbeResult ProbeUrl(const std::wstring& url) {
     }
     result.httpStatus = rangeStatus;
     result.retryAfterSeconds = GetRetryAfterSeconds(prefixResponse->request);
+    {
+        HttpDigestValues current{result.representationSha256Hex, result.representationSha512Hex};
+        const auto incoming = ParseHttpDigestValues(
+            QueryCustomHeader(prefixResponse->request, L"Repr-Digest"));
+        if (!MergeProbeDigestValues(current, incoming, result.error)) return result;
+        result.representationSha256Hex = std::move(current.sha256Hex);
+        result.representationSha512Hex = std::move(current.sha512Hex);
+    }
     if (result.suggestedFileName.empty())
         result.suggestedFileName = ParseContentDispositionFilename(
             QueryCustomHeader(prefixResponse->request, L"Content-Disposition"));
@@ -498,6 +811,14 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         DWORD middleStatus = 0;
         std::wstring middleError;
         auto middleResponse = StartRequest(url, L"GET", middleHeaders, middleStatus, middleError);
+        if (middleResponse) {
+            HttpDigestValues current{result.representationSha256Hex, result.representationSha512Hex};
+            const auto incoming = ParseHttpDigestValues(
+                QueryCustomHeader(middleResponse->request, L"Repr-Digest"));
+            if (!MergeProbeDigestValues(current, incoming, result.error)) return result;
+            result.representationSha256Hex = std::move(current.sha256Hex);
+            result.representationSha512Hex = std::move(current.sha512Hex);
+        }
         uint64_t parsedStart = 0, parsedEnd = 0, parsedTotal = 0;
         if (!middleResponse || middleStatus != 206 ||
             !ParseContentRange(QueryHeader(middleResponse->request, WINHTTP_QUERY_CONTENT_RANGE),
@@ -528,6 +849,14 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         DWORD tailStatus = 0;
         std::wstring tailError;
         auto tailResponse = StartRequest(url, L"GET", tailHeaders, tailStatus, tailError);
+        if (tailResponse) {
+            HttpDigestValues current{result.representationSha256Hex, result.representationSha512Hex};
+            const auto incoming = ParseHttpDigestValues(
+                QueryCustomHeader(tailResponse->request, L"Repr-Digest"));
+            if (!MergeProbeDigestValues(current, incoming, result.error)) return result;
+            result.representationSha256Hex = std::move(current.sha256Hex);
+            result.representationSha512Hex = std::move(current.sha512Hex);
+        }
         if (!tailResponse || tailStatus != 206) {
             result.error = tailError.empty() ? L"Server failed the final-byte range check" : tailError;
             result.rangeCapable = false;
@@ -665,6 +994,17 @@ RangeResult DownloadRange(Download& download, const std::shared_ptr<Mirror>& mir
         return result;
     }
 
+    const HttpDigestValues rangeDigests = ParseHttpDigestValues(
+        QueryCustomHeader(response->request, L"Repr-Digest"));
+    if (!rangeDigests.sha256Hex.empty() || !rangeDigests.sha512Hex.empty()) {
+        std::lock_guard digestLock(download.mutex);
+        if (!AcceptResponseDigestLocked(download, *mirror, rangeDigests,
+                                        L"Repr-Digest", result.error)) {
+            result.protocolMismatch = true;
+            return result;
+        }
+    }
+
     HANDLE output = CreateFileW(download.partPath.c_str(), GENERIC_WRITE,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
@@ -791,6 +1131,24 @@ FullResult DownloadFull(Download& download, const std::shared_ptr<Mirror>& mirro
         result.error = L"Expected HTTP 200 for full download, received HTTP " + std::to_wstring(status);
         return result;
     }
+
+    HttpDigestValues fullResponseDigests = ParseHttpDigestValues(
+        QueryCustomHeader(response->request, L"Repr-Digest"));
+    const wchar_t* digestHeaderSource = L"Repr-Digest";
+    if (fullResponseDigests.sha256Hex.empty() && fullResponseDigests.sha512Hex.empty()) {
+        const std::wstring contentEncoding = QueryCustomHeader(response->request, L"Content-Encoding");
+        if (contentEncoding.empty() || _wcsicmp(contentEncoding.c_str(), L"identity") == 0) {
+            fullResponseDigests = ParseHttpDigestValues(
+                QueryCustomHeader(response->request, L"Content-Digest"));
+            digestHeaderSource = L"Content-Digest";
+        }
+    }
+    if (!fullResponseDigests.sha256Hex.empty() || !fullResponseDigests.sha512Hex.empty()) {
+        std::lock_guard digestLock(download.mutex);
+        if (!AcceptResponseDigestLocked(download, *mirror, fullResponseDigests,
+                                        digestHeaderSource, result.error)) return result;
+    }
+
     uint64_t headerSize = 0;
     if (ParseUnsigned(QueryHeader(response->request, WINHTTP_QUERY_CONTENT_LENGTH), headerSize)) {
         result.responseSizeKnown = true;
@@ -1253,6 +1611,13 @@ Download::Download(const std::wstring& folder, const std::wstring& name,
         restoredReferencePrefixHash = resume->referencePrefixHash;
         restoredReferenceMiddleHash = resume->referenceMiddleHash;
         restoredReferenceSuffixHash = resume->referenceSuffixHash;
+        expectedSha256Hex = resume->expectedSha256Hex;
+        expectedSha512Hex = resume->expectedSha512Hex;
+        computedSha256Hex = resume->computedSha256Hex;
+        computedSha512Hex = resume->computedSha512Hex;
+        integrityStatusText = resume->integrityStatusText;
+        integrityDigestSource = resume->integrityDigestSource;
+        integrityDigestSourceUrl = resume->integrityDigestSourceUrl;
         restoredCompletedSegmentIndices = resume->completedSegmentIndices;
         restoredPartialSegmentBytes = resume->partialSegmentBytes;
         restorePending = resume->segmentBytes > 0 && resume->totalSize > 0;
@@ -2023,6 +2388,8 @@ void Download::ProbeOne(const std::shared_ptr<Mirror>& mirror) {
         mirror->rangeCapable = result.rangeCapable;
         mirror->etag = result.etag;
         mirror->lastModified = result.lastModified;
+        mirror->representationSha256Hex = result.representationSha256Hex;
+        mirror->representationSha512Hex = result.representationSha512Hex;
         mirror->prefixSample = std::move(result.prefix);
         mirror->middleSample = std::move(result.middle);
         mirror->suffixSample = std::move(result.suffix);
@@ -2146,6 +2513,35 @@ void Download::ReevaluateMirrorsLocked() {
         }
     }
 
+    // Prefer the digest from the sampled reference mirror. If it did not publish one,
+    // use a digest from another mirror only after its size and samples match the reference.
+    if (expectedSha256Hex.empty() || expectedSha512Hex.empty()) {
+        auto digestReference = std::find_if(mirrors.begin(), mirrors.end(), [&](const auto& mirror) {
+            return mirror->id == referenceMirrorId && mirror->active && mirror->probeDone &&
+                   mirror->probeOk && mirror->prefixSample == referencePrefix &&
+                   (!referenceSizeKnown || (mirror->sizeKnown && mirror->size == referenceSize)) &&
+                   (!mirror->representationSha256Hex.empty() || !mirror->representationSha512Hex.empty());
+        });
+        if (digestReference == mirrors.end()) {
+            digestReference = std::find_if(mirrors.begin(), mirrors.end(), [&](const auto& mirror) {
+                return mirror->active && mirror->probeDone && mirror->probeOk &&
+                       mirror->prefixSample == referencePrefix &&
+                       (!referenceSizeKnown || (mirror->sizeKnown && mirror->size == referenceSize)) &&
+                       (!mirror->representationSha256Hex.empty() || !mirror->representationSha512Hex.empty());
+            });
+        }
+        if (digestReference != mirrors.end()) {
+            if (expectedSha256Hex.empty())
+                expectedSha256Hex = (*digestReference)->representationSha256Hex;
+            if (expectedSha512Hex.empty())
+                expectedSha512Hex = (*digestReference)->representationSha512Hex;
+            if (integrityDigestSource.empty()) {
+                integrityDigestSource = L"Repr-Digest";
+                integrityDigestSourceUrl = (*digestReference)->url;
+            }
+        }
+    }
+
     for (auto& mirror : mirrors) {
         if (!mirror->active) {
             mirror->compatible = false;
@@ -2159,8 +2555,17 @@ void Download::ReevaluateMirrorsLocked() {
         bool same = mirror->prefixSample == referencePrefix;
         if (referenceSizeKnown && mirror->sizeKnown && mirror->size != referenceSize) same = false;
         if (referenceSizeKnown && !mirror->sizeKnown) same = false;
+        const bool digestMismatch =
+            (!expectedSha256Hex.empty() && !mirror->representationSha256Hex.empty() &&
+             expectedSha256Hex != mirror->representationSha256Hex) ||
+            (!expectedSha512Hex.empty() && !mirror->representationSha512Hex.empty() &&
+             expectedSha512Hex != mirror->representationSha512Hex);
+        if (digestMismatch) same = false;
         mirror->compatible = same;
-        if (!same) {
+        if (digestMismatch) {
+            mirror->state = L"Incompatible digest";
+            mirror->lastError = L"The server-provided full-representation digest does not match the reference mirror";
+        } else if (!same) {
             mirror->state = L"Incompatible sample";
             mirror->lastError = L"Size or sampled bytes do not match the reference mirror";
         } else if (mirror->rangeCapable && rangeReferenceReady &&
@@ -2835,6 +3240,83 @@ bool Download::RunFallback() {
 }
 
 bool Download::FinalizeFile(std::wstring& error) {
+    std::wstring workingPath;
+    std::wstring expectedSha256;
+    std::wstring expectedSha512;
+    uint64_t expectedSize = 0;
+    bool expectedSizeKnown = false;
+    {
+        std::lock_guard lock(mutex);
+        workingPath = partPath;
+        expectedSha256 = expectedSha256Hex;
+        expectedSha512 = expectedSha512Hex;
+        expectedSize = totalSize;
+        expectedSizeKnown = sizeKnown;
+        statusText = L"Verifying file integrity";
+        integrityStatusText = L"Calculating full-file SHA-256";
+        computedSha256Hex.clear();
+        computedSha512Hex.clear();
+    }
+
+    std::wstring calculatedSha256;
+    std::wstring calculatedSha512;
+    uint64_t actualSize = 0;
+    std::wstring hashError;
+    if (!ComputeFileDigests(workingPath, !expectedSha512.empty(),
+                            calculatedSha256, calculatedSha512, actualSize, hashError)) {
+        error = L"Checksum calculation failed. The completed .linkforge.part file and its saved progress were left untouched. " +
+                hashError;
+        std::lock_guard lock(mutex);
+        integrityStatusText = L"Checksum calculation failed — working file preserved";
+        return false;
+    }
+    if (expectedSizeKnown && actualSize != expectedSize) {
+        error = L"Checksum verification refused to finalize the file because its current size (" +
+                std::to_wstring(actualSize) + L" bytes) differs from the expected size (" +
+                std::to_wstring(expectedSize) + L" bytes). The .linkforge.part file and saved progress were kept.";
+        std::lock_guard lock(mutex);
+        computedSha256Hex = calculatedSha256;
+        computedSha512Hex = calculatedSha512;
+        integrityStatusText = L"File size mismatch — working file preserved";
+        return false;
+    }
+
+    const bool sha256Mismatch = !expectedSha256.empty() && expectedSha256 != calculatedSha256;
+    const bool sha512Mismatch = !expectedSha512.empty() && expectedSha512 != calculatedSha512;
+    {
+        std::lock_guard lock(mutex);
+        computedSha256Hex = calculatedSha256;
+        computedSha512Hex = calculatedSha512;
+        if (sha256Mismatch || sha512Mismatch) {
+            integrityStatusText = L"Checksum mismatch — working file preserved";
+            error = L"Checksum mismatch: server-provided full-file digest did not match the completed .linkforge.part file.";
+            if (sha256Mismatch)
+                error += L" SHA-256 expected " + expectedSha256 + L", calculated " + calculatedSha256 + L".";
+            if (sha512Mismatch)
+                error += L" SHA-512 expected " + expectedSha512 + L", calculated " + calculatedSha512 + L".";
+            error += L" The working file and saved chunk metadata were preserved; no final rename was performed.";
+            return false;
+        }
+
+        if (expectedSha256.empty() && expectedSha512.empty()) {
+            integrityStatusText =
+                L"Local SHA-256 calculated; server did not provide a supported full-file digest. "
+                L"This is a local fingerprint, not independent verification.";
+        } else {
+            std::wstring algorithms;
+            if (!expectedSha256.empty()) algorithms = L"SHA-256";
+            if (!expectedSha512.empty()) algorithms += algorithms.empty() ? L"SHA-512" : L" and SHA-512";
+            const std::wstring source = integrityDigestSource.empty() ? L"server digest" : integrityDigestSource;
+            const bool httpsSource = integrityDigestSourceUrl.rfind(L"https://", 0) == 0;
+            integrityStatusText = L"Verified against " + source + L" (" + algorithms + L")";
+            if (!integrityDigestSourceUrl.empty()) {
+                integrityStatusText += httpsSource
+                    ? L"; supplied over HTTPS"
+                    : L"; supplied over unencrypted HTTP (not authenticated)";
+            }
+        }
+    }
+
     for (unsigned int attempt = 0; attempt < 1000; ++attempt) {
         if (MoveFileExW(partPath.c_str(), finalPath.c_str(), MOVEFILE_WRITE_THROUGH)) return true;
         const DWORD code = GetLastError();
@@ -2896,6 +3378,13 @@ bool Download::ClearResumeDataLocked() {
     referencePrefixHash = 0;
     referenceMiddleHash = 0;
     referenceSuffixHash = 0;
+    expectedSha256Hex.clear();
+    expectedSha512Hex.clear();
+    computedSha256Hex.clear();
+    computedSha512Hex.clear();
+    integrityStatusText.clear();
+    integrityDigestSource.clear();
+    integrityDigestSourceUrl.clear();
     restoredCompletedSegmentIndices.clear();
     restoredPartialSegmentBytes.clear();
     segments.clear();
@@ -3181,7 +3670,12 @@ void Download::RunInternal() {
                     lastError = error;
                 }
 
-                SetStatus(*this, DownloadPhase::Failed, L"Failed to finalize file");
+                SetStatus(*this, DownloadPhase::Failed,
+                    error.find(L"Checksum") != std::wstring::npos
+                        ? L"Checksum verification failed - working file kept"
+                        : (error.find(L"size (") != std::wstring::npos
+                            ? L"File size mismatch - working file kept"
+                            : L"Failed to finalize file"));
                 return;
             }
 
@@ -3240,7 +3734,12 @@ void Download::RunInternal() {
                         lastError = error;
                     }
 
-                    SetStatus(*this, DownloadPhase::Failed, L"Failed to finalize file");
+                    SetStatus(*this, DownloadPhase::Failed,
+                    error.find(L"Checksum") != std::wstring::npos
+                        ? L"Checksum verification failed - working file kept"
+                        : (error.find(L"size (") != std::wstring::npos
+                            ? L"File size mismatch - working file kept"
+                            : L"Failed to finalize file"));
                 }
                 return;
             }
@@ -3255,7 +3754,12 @@ void Download::RunInternal() {
                 lastError = error;
             }
 
-            SetStatus(*this, DownloadPhase::Failed, L"Failed to finalize file");
+            SetStatus(*this, DownloadPhase::Failed,
+                    error.find(L"Checksum") != std::wstring::npos
+                        ? L"Checksum verification failed - working file kept"
+                        : (error.find(L"size (") != std::wstring::npos
+                            ? L"File size mismatch - working file kept"
+                            : L"Failed to finalize file"));
             return;
         }
     }

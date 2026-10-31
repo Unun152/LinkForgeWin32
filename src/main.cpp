@@ -95,8 +95,6 @@ const COLORREF kBorder = RGB(55, 60, 70);
 HINSTANCE g_instance = nullptr;
 HWND g_mainWindow = nullptr;
 HWND g_mainList = nullptr;
-HWND g_mainTooltip = nullptr;
-std::wstring g_mainTooltipText;
 HWND g_statusText = nullptr;
 HWND g_pauseButton = nullptr;
 HWND g_clearCompletedButton = nullptr;
@@ -697,6 +695,8 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         std::vector<uint64_t> completedSegments;
         std::vector<std::pair<uint64_t, uint64_t>> partialSegments;
         std::wstring folder, filename, finalPath, partPath, phaseName, statusText, lastError;
+        std::wstring expectedSha256, expectedSha512, computedSha256, computedSha512;
+        std::wstring integrityStatus, integritySource, integritySourceUrl;
         uint64_t totalSize = 0, segmentBytes = 0;
         uint64_t prefixHash = 0, middleHash = 0, suffixHash = 0;
         bool sizeKnown = false, userPaused = false, completed = false, failed = false, cancelled = false;
@@ -712,6 +712,13 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
             partPath = download->partPath;
             statusText = download->statusText;
             lastError = download->lastError;
+            expectedSha256 = download->expectedSha256Hex;
+            expectedSha512 = download->expectedSha512Hex;
+            computedSha256 = download->computedSha256Hex;
+            computedSha512 = download->computedSha512Hex;
+            integrityStatus = download->integrityStatusText;
+            integritySource = download->integrityDigestSource;
+            integritySourceUrl = download->integrityDigestSourceUrl;
             totalSize = download->totalSize;
             sizeKnown = download->sizeKnown;
             segmentBytes = download->persistentSegmentBytes ? download->persistentSegmentBytes : download->restoredSegmentBytes;
@@ -787,6 +794,13 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         ok &= WriteStateString(tempPath, section.c_str(), L"Phase", phaseName);
         ok &= WriteStateString(tempPath, section.c_str(), L"StatusText", MakeIniSingleLine(statusText));
         ok &= WriteStateString(tempPath, section.c_str(), L"LastError", MakeIniSingleLine(lastError));
+        ok &= WriteStateString(tempPath, section.c_str(), L"ExpectedSha256", expectedSha256);
+        ok &= WriteStateString(tempPath, section.c_str(), L"ExpectedSha512", expectedSha512);
+        ok &= WriteStateString(tempPath, section.c_str(), L"ComputedSha256", computedSha256);
+        ok &= WriteStateString(tempPath, section.c_str(), L"ComputedSha512", computedSha512);
+        ok &= WriteStateString(tempPath, section.c_str(), L"IntegrityStatus", MakeIniSingleLine(integrityStatus));
+        ok &= WriteStateString(tempPath, section.c_str(), L"IntegritySource", integritySource);
+        ok &= WriteStateString(tempPath, section.c_str(), L"IntegritySourceUrl", integritySourceUrl);
         ok &= WriteStateString(tempPath, section.c_str(), L"SizeKnown", sizeKnown ? L"1" : L"0");
         ok &= WriteStateString(tempPath, section.c_str(), L"TotalSize", std::to_wstring(totalSize));
         ok &= WriteStateString(tempPath, section.c_str(), L"SegmentBytes", std::to_wstring(segmentBytes));
@@ -886,6 +900,13 @@ void LoadDownloadsFromFile() {
         resume.partPath = ReadStateString(section.c_str(), L"PartPath", g_downloadsStatePath);
         resume.statusText = ReadStateString(section.c_str(), L"StatusText", g_downloadsStatePath);
         resume.lastError = ReadStateString(section.c_str(), L"LastError", g_downloadsStatePath);
+        resume.expectedSha256Hex = ReadStateString(section.c_str(), L"ExpectedSha256", g_downloadsStatePath);
+        resume.expectedSha512Hex = ReadStateString(section.c_str(), L"ExpectedSha512", g_downloadsStatePath);
+        resume.computedSha256Hex = ReadStateString(section.c_str(), L"ComputedSha256", g_downloadsStatePath);
+        resume.computedSha512Hex = ReadStateString(section.c_str(), L"ComputedSha512", g_downloadsStatePath);
+        resume.integrityStatusText = ReadStateString(section.c_str(), L"IntegrityStatus", g_downloadsStatePath);
+        resume.integrityDigestSource = ReadStateString(section.c_str(), L"IntegritySource", g_downloadsStatePath);
+        resume.integrityDigestSourceUrl = ReadStateString(section.c_str(), L"IntegritySourceUrl", g_downloadsStatePath);
         resume.sizeKnown = GetPrivateProfileIntW(section.c_str(), L"SizeKnown", 0, g_downloadsStatePath.c_str()) != 0;
         resume.totalSize = _wcstoui64(ReadStateString(section.c_str(), L"TotalSize", g_downloadsStatePath).c_str(), nullptr, 10);
         resume.segmentBytes = _wcstoui64(ReadStateString(section.c_str(), L"SegmentBytes", g_downloadsStatePath).c_str(), nullptr, 10);
@@ -1292,6 +1313,13 @@ std::wstring GetDownloadStatusTextLocked(const Download& download) {
     const auto errorHas = [&](const wchar_t* value) { return error.find(value) != std::wstring::npos; };
 
     if (download.userPaused) return download.pauseSettled ? L"Paused" : L"Pausing — saving progress";
+    if (status.find(L"Verifying file integrity") != std::wstring::npos) return L"Verifying file integrity";
+    if (status.find(L"Checksum mismatch") != std::wstring::npos)
+        return L"Checksum mismatch — data kept";
+    if (status.find(L"Checksum verification failed") != std::wstring::npos)
+        return L"Checksum check failed — data kept";
+    if (status.find(L"File size mismatch") != std::wstring::npos)
+        return L"File size mismatch — data kept";
     if (download.phase == DownloadPhase::Paused) return L"Paused";
     if (download.phase == DownloadPhase::Pausing) return L"Pausing — saving progress";
 
@@ -1364,6 +1392,21 @@ std::wstring GetDownloadStatusTooltipLocked(const Download& download) {
         result += L"\r\n\r\nState: " + download.statusText;
     if (!download.lastError.empty() && download.lastError != download.statusText)
         result += L"\r\n\r\nDetails:\r\n" + download.lastError;
+    if (!download.integrityStatusText.empty()) {
+        result += L"\r\n\r\nIntegrity verification:\r\n" + download.integrityStatusText;
+        if (!download.integrityDigestSource.empty())
+            result += L"\r\nDigest header: " + download.integrityDigestSource;
+        if (!download.integrityDigestSourceUrl.empty())
+            result += L"\r\nDigest source: " + download.integrityDigestSourceUrl;
+        if (!download.expectedSha256Hex.empty())
+            result += L"\r\nServer SHA-256: " + download.expectedSha256Hex;
+        if (!download.computedSha256Hex.empty())
+            result += L"\r\nLocal SHA-256: " + download.computedSha256Hex;
+        if (!download.expectedSha512Hex.empty())
+            result += L"\r\nServer SHA-512: " + download.expectedSha512Hex;
+        if (!download.computedSha512Hex.empty())
+            result += L"\r\nLocal SHA-512: " + download.computedSha512Hex;
+    }
     return result;
 }
 
@@ -1488,16 +1531,10 @@ bool HandleListCellTooltip(HWND tooltip, HWND list, int statusColumn, HWND extra
         hit.pt = client;
         const int row = ListView_SubItemHitTest(list, &hit);
         if (row >= 0 && hit.iSubItem == statusColumn) {
-            if (list == g_mainList && statusColumn == 5 && row < static_cast<int>(g_downloads.size())) {
-                const auto& download = g_downloads[static_cast<size_t>(row)];
-                std::lock_guard lock(download->mutex);
-                textStorage = GetDownloadStatusTooltipLocked(*download);
-            } else {
-                wchar_t cellText[8192]{};
-                ListView_GetItemText(list, row, statusColumn, cellText,
-                                     static_cast<int>(std::size(cellText)));
-                textStorage = cellText;
-            }
+            wchar_t cellText[8192]{};
+            ListView_GetItemText(list, row, statusColumn, cellText,
+                                 static_cast<int>(std::size(cellText)));
+            textStorage = cellText;
         }
     }
 
@@ -2622,7 +2659,6 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         AddColumn(g_mainList, 3, L"Speed", 105);
         AddColumn(g_mainList, 4, L"ETA (avg)", 95);
         AddColumn(g_mainList, 5, L"Status", 210);
-        g_mainTooltip = CreateListCellTooltip(hwnd, g_mainList);
         g_statusText = CreateLabel(hwnd, L"Ready", 22, 608, 900, 22);
         g_clearCompletedButton = CreateDarkButton(hwnd, L"Clear completed", ID_CLEAR_COMPLETED, 0, 0, 120, 30);
         RECT initialClient{};
@@ -2882,8 +2918,6 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     case WM_NOTIFY: {
         auto* header = reinterpret_cast<NMHDR*>(lParam);
-        if (HandleListCellTooltip(g_mainTooltip, g_mainList, 5, nullptr, g_mainTooltipText, lParam))
-            return 0;
         if (header && header->hwndFrom == g_mainList && header->code == NM_CUSTOMDRAW) {
             return HandleListCustomDraw(g_mainList, lParam, true);
         }

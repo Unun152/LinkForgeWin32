@@ -29,6 +29,7 @@ target_compile_definitions(LinkForge PRIVATE
 target_include_directories(LinkForge PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(LinkForge PRIVATE
     winhttp
+    bcrypt
     comctl32
     uxtheme
     shell32
