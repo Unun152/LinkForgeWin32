@@ -719,10 +719,12 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         }
         result.etag = QueryHeader(head->request, WINHTTP_QUERY_ETAG);
         result.lastModified = QueryHeader(head->request, WINHTTP_QUERY_LAST_MODIFIED);
-        const HttpDigestValues headDigests = ParseHttpDigestValues(
-            QueryCustomHeader(head->request, L"Repr-Digest"));
-        result.representationSha256Hex = headDigests.sha256Hex;
-        result.representationSha512Hex = headDigests.sha512Hex;
+        if (status >= 200 && status < 300) {
+            const HttpDigestValues headDigests = ParseHttpDigestValues(
+                QueryCustomHeader(head->request, L"Repr-Digest"));
+            result.representationSha256Hex = headDigests.sha256Hex;
+            result.representationSha512Hex = headDigests.sha512Hex;
+        }
         result.suggestedFileName = ParseContentDispositionFilename(
             QueryCustomHeader(head->request, L"Content-Disposition"));
     }
@@ -745,6 +747,13 @@ ProbeResult ProbeUrl(const std::wstring& url) {
     }
     result.httpStatus = rangeStatus;
     result.retryAfterSeconds = GetRetryAfterSeconds(prefixResponse->request);
+    if (result.suggestedFileName.empty())
+        result.suggestedFileName = ParseContentDispositionFilename(
+            QueryCustomHeader(prefixResponse->request, L"Content-Disposition"));
+    if (rangeStatus != 200 && rangeStatus != 206) {
+        result.error = L"HTTP " + std::to_wstring(rangeStatus);
+        return result;
+    }
     {
         HttpDigestValues current{result.representationSha256Hex, result.representationSha512Hex};
         const auto incoming = ParseHttpDigestValues(
@@ -752,13 +761,6 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         if (!MergeProbeDigestValues(current, incoming, result.error)) return result;
         result.representationSha256Hex = std::move(current.sha256Hex);
         result.representationSha512Hex = std::move(current.sha512Hex);
-    }
-    if (result.suggestedFileName.empty())
-        result.suggestedFileName = ParseContentDispositionFilename(
-            QueryCustomHeader(prefixResponse->request, L"Content-Disposition"));
-    if (rangeStatus != 200 && rangeStatus != 206) {
-        result.error = L"HTTP " + std::to_wstring(rangeStatus);
-        return result;
     }
 
     const std::wstring contentLength = QueryHeader(prefixResponse->request, WINHTTP_QUERY_CONTENT_LENGTH);
@@ -811,14 +813,6 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         DWORD middleStatus = 0;
         std::wstring middleError;
         auto middleResponse = StartRequest(url, L"GET", middleHeaders, middleStatus, middleError);
-        if (middleResponse) {
-            HttpDigestValues current{result.representationSha256Hex, result.representationSha512Hex};
-            const auto incoming = ParseHttpDigestValues(
-                QueryCustomHeader(middleResponse->request, L"Repr-Digest"));
-            if (!MergeProbeDigestValues(current, incoming, result.error)) return result;
-            result.representationSha256Hex = std::move(current.sha256Hex);
-            result.representationSha512Hex = std::move(current.sha512Hex);
-        }
         uint64_t parsedStart = 0, parsedEnd = 0, parsedTotal = 0;
         if (!middleResponse || middleStatus != 206 ||
             !ParseContentRange(QueryHeader(middleResponse->request, WINHTTP_QUERY_CONTENT_RANGE),
@@ -835,6 +829,14 @@ ProbeResult ProbeUrl(const std::wstring& url) {
             result.ok = !result.prefix.empty() || (result.sizeKnown && result.size == 0);
             return result;
         }
+        {
+            HttpDigestValues current{result.representationSha256Hex, result.representationSha512Hex};
+            const auto incoming = ParseHttpDigestValues(
+                QueryCustomHeader(middleResponse->request, L"Repr-Digest"));
+            if (!MergeProbeDigestValues(current, incoming, result.error)) return result;
+            result.representationSha256Hex = std::move(current.sha256Hex);
+            result.representationSha512Hex = std::move(current.sha512Hex);
+        }
     } else {
         // For files this small, prefix and suffix samples overlap enough to cover all bytes.
         result.middle = result.prefix;
@@ -849,14 +851,6 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         DWORD tailStatus = 0;
         std::wstring tailError;
         auto tailResponse = StartRequest(url, L"GET", tailHeaders, tailStatus, tailError);
-        if (tailResponse) {
-            HttpDigestValues current{result.representationSha256Hex, result.representationSha512Hex};
-            const auto incoming = ParseHttpDigestValues(
-                QueryCustomHeader(tailResponse->request, L"Repr-Digest"));
-            if (!MergeProbeDigestValues(current, incoming, result.error)) return result;
-            result.representationSha256Hex = std::move(current.sha256Hex);
-            result.representationSha512Hex = std::move(current.sha512Hex);
-        }
         if (!tailResponse || tailStatus != 206) {
             result.error = tailError.empty() ? L"Server failed the final-byte range check" : tailError;
             result.rangeCapable = false;
@@ -890,6 +884,14 @@ ProbeResult ProbeUrl(const std::wstring& url) {
             result.suffix.clear();
             result.ok = !result.prefix.empty() || (result.sizeKnown && result.size == 0);
             return result;
+        }
+        {
+            HttpDigestValues current{result.representationSha256Hex, result.representationSha512Hex};
+            const auto incoming = ParseHttpDigestValues(
+                QueryCustomHeader(tailResponse->request, L"Repr-Digest"));
+            if (!MergeProbeDigestValues(current, incoming, result.error)) return result;
+            result.representationSha256Hex = std::move(current.sha256Hex);
+            result.representationSha512Hex = std::move(current.sha512Hex);
         }
     } else {
         result.suffix = result.prefix;
@@ -3671,11 +3673,13 @@ void Download::RunInternal() {
                 }
 
                 SetStatus(*this, DownloadPhase::Failed,
-                    error.find(L"Checksum") != std::wstring::npos
-                        ? L"Checksum verification failed - working file kept"
-                        : (error.find(L"size (") != std::wstring::npos
+                    error.find(L"Checksum mismatch:") != std::wstring::npos
+                        ? L"Checksum mismatch - downloaded file kept"
+                        : (error.find(L"expected size (") != std::wstring::npos
                             ? L"File size mismatch - working file kept"
-                            : L"Failed to finalize file"));
+                            : (error.find(L"Checksum") != std::wstring::npos
+                                ? L"Checksum verification failed - working file kept"
+                                : L"Failed to finalize file")));
                 return;
             }
 
@@ -3735,11 +3739,13 @@ void Download::RunInternal() {
                     }
 
                     SetStatus(*this, DownloadPhase::Failed,
-                    error.find(L"Checksum") != std::wstring::npos
-                        ? L"Checksum verification failed - working file kept"
-                        : (error.find(L"size (") != std::wstring::npos
+                    error.find(L"Checksum mismatch:") != std::wstring::npos
+                        ? L"Checksum mismatch - downloaded file kept"
+                        : (error.find(L"expected size (") != std::wstring::npos
                             ? L"File size mismatch - working file kept"
-                            : L"Failed to finalize file"));
+                            : (error.find(L"Checksum") != std::wstring::npos
+                                ? L"Checksum verification failed - working file kept"
+                                : L"Failed to finalize file")));
                 }
                 return;
             }
@@ -3755,11 +3761,13 @@ void Download::RunInternal() {
             }
 
             SetStatus(*this, DownloadPhase::Failed,
-                    error.find(L"Checksum") != std::wstring::npos
-                        ? L"Checksum verification failed - working file kept"
-                        : (error.find(L"size (") != std::wstring::npos
+                    error.find(L"Checksum mismatch:") != std::wstring::npos
+                        ? L"Checksum mismatch - downloaded file kept"
+                        : (error.find(L"expected size (") != std::wstring::npos
                             ? L"File size mismatch - working file kept"
-                            : L"Failed to finalize file"));
+                            : (error.find(L"Checksum") != std::wstring::npos
+                                ? L"Checksum verification failed - working file kept"
+                                : L"Failed to finalize file")));
             return;
         }
     }
