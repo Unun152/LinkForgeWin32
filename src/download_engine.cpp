@@ -1349,7 +1349,7 @@ bool Download::RequestCancel(bool keepWorkingFile) {
         finishImmediately = terminal || !started;
         if (!finishImmediately) {
             userPaused = false;
-            statusText = keepPartial
+            statusText = keepWorkingFile
                 ? L"Cancelling; handing the unfinished working file to you..."
                 : L"Cancelling; deleting the unfinished working file...";
         }
@@ -1438,7 +1438,7 @@ void Download::Resume() {
     if (shouldStart) {
         if (shouldRetry) {
             std::wstring confirmationMessage;
-            Retry(false, confirmationMessage);
+            Retry(WorkingFileAction::Ask, confirmationMessage);
         } else {
             Start();
         }
@@ -1946,11 +1946,12 @@ void Download::ProbeOne(const std::shared_ptr<Mirror>& mirror) {
                                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (reservation != INVALID_HANDLE_VALUE) {
                     LARGE_INTEGER reservationSize{};
-                    const bool sizeKnown = GetFileSizeEx(reservation, &reservationSize) != FALSE;
-                    const DWORD sizeError = sizeKnown ? ERROR_SUCCESS : GetLastError();
+                    const bool reservationSizeKnown =
+                        GetFileSizeEx(reservation, &reservationSize) != FALSE;
+                    const DWORD sizeError = reservationSizeKnown ? ERROR_SUCCESS : GetLastError();
                     CloseHandle(reservation);
 
-                    if (!sizeKnown) {
+                    if (!reservationSizeKnown) {
                         lastError = L"Could not inspect the empty working-file reservation before changing its name: " +
                                     std::to_wstring(sizeError);
                     } else if (reservationSize.QuadPart == 0) {
