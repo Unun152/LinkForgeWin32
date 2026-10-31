@@ -10,7 +10,12 @@ add_executable(LinkForge WIN32
     src/download_engine.cpp
     src/download_engine.h
     app.rc
+    assets/LinkForge.ico
 )
+
+set_source_files_properties(assets/LinkForge.ico PROPERTIES HEADER_FILE_ONLY TRUE)
+set_property(SOURCE app.rc APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/LinkForge.ico")
 
 target_compile_features(LinkForge PRIVATE cxx_std_20)
 target_compile_definitions(LinkForge PRIVATE

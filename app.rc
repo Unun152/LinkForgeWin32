@@ -1,2 +1,4 @@
 #include <windows.h>
+
+101 ICON "assets/LinkForge.ico"
 1 RT_MANIFEST "LinkForge.manifest"

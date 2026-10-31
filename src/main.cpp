@@ -72,6 +72,7 @@ constexpr int ID_SETTINGS_USER_AGENT = 4010;
 constexpr int ID_SETTINGS_SAVE = 4011;
 constexpr int ID_SETTINGS_CANCEL = 4012;
 constexpr int ID_SETTINGS_SEGMENT_SIZE = 4013;
+constexpr WORD IDI_APP_ICON = 101;
 
 const COLORREF kWindowBg = RGB(22, 24, 29);
 const COLORREF kPanelBg = RGB(30, 33, 40);
@@ -2123,7 +2124,12 @@ bool RegisterClasses() {
     mainClass.lpfnWndProc = MainProc;
     mainClass.hInstance = g_instance;
     mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    mainClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    mainClass.hIcon = reinterpret_cast<HICON>(LoadImageW(
+        g_instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+    mainClass.hIconSm = reinterpret_cast<HICON>(LoadImageW(
+        g_instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
     mainClass.hbrBackground = g_windowBrush;
     mainClass.lpszClassName = kMainClass;
     if (!RegisterClassExW(&mainClass)) return false;

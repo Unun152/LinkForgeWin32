@@ -880,7 +880,13 @@ FullResult DownloadFull(Download& download, const std::shared_ptr<Mirror>& mirro
         result.bytes = position;
         AddReceivedBytes(download, mirror, -1, got, true);
     }
-    FlushFileBuffers(output);
+    if (!FlushFileBuffers(output)) {
+        const DWORD errorCode = GetLastError();
+        result.ok = false;
+        const std::wstring flushError = L"Could not flush downloaded data to disk: " + std::to_wstring(errorCode);
+        if (result.error.empty()) result.error = flushError;
+        else result.error += L"; " + flushError;
+    }
     CloseHandle(output);
 
     bool switchToParallel = false;
