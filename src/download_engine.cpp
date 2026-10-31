@@ -127,6 +127,12 @@ uint64_t HashSample(const std::vector<unsigned char>& bytes) {
 struct HttpDigestValues {
     std::wstring sha256Hex;
     std::wstring sha512Hex;
+    bool sha256Invalid = false;
+    bool sha512Invalid = false;
+
+    bool HasInvalid() const {
+        return sha256Invalid || sha512Invalid;
+    }
 };
 
 int Base64Value(wchar_t value) {
@@ -153,7 +159,9 @@ bool DecodeDigestBase64(const std::wstring& encoded, size_t expectedBytes,
         const int c = pad2 ? 0 : Base64Value(encoded[index + 2]);
         const int d = pad3 ? 0 : Base64Value(encoded[index + 3]);
         if (a < 0 || b < 0 || c < 0 || d < 0 ||
-            (!finalBlock && (pad2 || pad3)) || (pad2 && !pad3)) return false;
+            (!finalBlock && (pad2 || pad3)) || (pad2 && !pad3) ||
+            (pad3 && !pad2 && (c & 0x03) != 0) ||
+            (pad2 && pad3 && (b & 0x0f) != 0)) return false;
 
         const uint32_t value = (static_cast<uint32_t>(a) << 18) |
                                (static_cast<uint32_t>(b) << 12) |
@@ -176,51 +184,86 @@ bool DecodeDigestBase64(const std::wstring& encoded, size_t expectedBytes,
 }
 
 bool ExtractStructuredDigest(const std::wstring& header, const wchar_t* algorithm,
-                             size_t digestBytes, std::wstring& hexOutput) {
+                             size_t digestBytes, std::wstring& hexOutput, bool& invalid) {
     std::wstring lower = header;
     std::transform(lower.begin(), lower.end(), lower.begin(),
                    [](wchar_t character) { return static_cast<wchar_t>(towlower(character)); });
     const std::wstring key = algorithm;
     size_t position = 0;
+    bool found = false;
     while ((position = lower.find(key, position)) != std::wstring::npos) {
-        const bool tokenStart = position == 0 || lower[position - 1] == L',' ||
-                                iswspace(lower[position - 1]);
+        size_t tokenPrefix = position;
+        while (tokenPrefix > 0 && iswspace(lower[tokenPrefix - 1])) --tokenPrefix;
+        const bool tokenStart = tokenPrefix == 0 || lower[tokenPrefix - 1] == L',';
         size_t cursor = position + key.size();
-        if (!tokenStart) {
+        if (!tokenStart ||
+            (cursor < lower.size() &&
+             (iswalnum(lower[cursor]) || lower[cursor] == L'-' || lower[cursor] == L'_'))) {
             position = cursor;
             continue;
         }
+
         while (cursor < lower.size() && iswspace(lower[cursor])) ++cursor;
         if (cursor >= lower.size() || lower[cursor] != L'=') {
+            invalid = true;
             position = cursor;
             continue;
         }
         ++cursor;
         while (cursor < lower.size() && iswspace(lower[cursor])) ++cursor;
         if (cursor >= lower.size() || lower[cursor] != L':') {
+            invalid = true;
             position = cursor;
             continue;
         }
+
         const size_t end = header.find(L':', cursor + 1);
-        if (end == std::wstring::npos) return false;
-        if (DecodeDigestBase64(header.substr(cursor + 1, end - cursor - 1),
-                               digestBytes, hexOutput)) return true;
+        if (end == std::wstring::npos) {
+            invalid = true;
+            return false;
+        }
+
+        std::wstring parsedHex;
+        if (!DecodeDigestBase64(header.substr(cursor + 1, end - cursor - 1),
+                                digestBytes, parsedHex)) {
+            invalid = true;
+        } else if (!found) {
+            hexOutput = std::move(parsedHex);
+        } else if (hexOutput != parsedHex) {
+            // A structured dictionary must not provide ambiguous duplicate values.
+            invalid = true;
+        }
+        found = true;
         position = end + 1;
     }
-    return false;
+    return found && !invalid;
 }
 
 HttpDigestValues ParseHttpDigestValues(const std::wstring& header) {
     HttpDigestValues result;
     // RFC 9530 Structured Field byte sequences. SHA-256 and SHA-512 are the
-    // active HTTP digest algorithms; deprecated MD5/SHA-1 values are ignored.
-    ExtractStructuredDigest(header, L"sha-256", 32, result.sha256Hex);
-    ExtractStructuredDigest(header, L"sha-512", 64, result.sha512Hex);
+    // active HTTP digest algorithms; unsupported algorithms such as MD5/SHA-1
+    // are ignored, but malformed claims for supported algorithms are not.
+    ExtractStructuredDigest(header, L"sha-256", 32, result.sha256Hex, result.sha256Invalid);
+    ExtractStructuredDigest(header, L"sha-512", 64, result.sha512Hex, result.sha512Invalid);
     return result;
+}
+
+std::wstring BuildMalformedDigestError(const HttpDigestValues& values, const wchar_t* headerName) {
+    std::wstring algorithms;
+    if (values.sha256Invalid) algorithms = L"SHA-256";
+    if (values.sha512Invalid) algorithms += algorithms.empty() ? L"SHA-512" : L" and SHA-512";
+    return L"The server returned a malformed supported " + algorithms + L" value in " +
+           headerName + L". LinkForge rejected the response instead of treating verification as unavailable; "
+           L"no existing working file or saved chunk metadata was discarded.";
 }
 
 bool MergeProbeDigestValues(HttpDigestValues& current, const HttpDigestValues& incoming,
                             std::wstring& error) {
+    if (incoming.HasInvalid()) {
+        error = BuildMalformedDigestError(incoming, L"Repr-Digest");
+        return false;
+    }
     if (!current.sha256Hex.empty() && !incoming.sha256Hex.empty() &&
         current.sha256Hex != incoming.sha256Hex) {
         error = L"The mirror returned conflicting SHA-256 Repr-Digest values during its range checks.";
@@ -239,6 +282,10 @@ bool MergeProbeDigestValues(HttpDigestValues& current, const HttpDigestValues& i
 bool AcceptResponseDigestLocked(Download& download, Mirror& mirror,
                                 const HttpDigestValues& incoming,
                                 const wchar_t* sourceHeader, std::wstring& error) {
+    if (incoming.HasInvalid()) {
+        error = BuildMalformedDigestError(incoming, sourceHeader);
+        return false;
+    }
     if (!incoming.sha256Hex.empty()) {
         if ((!download.expectedSha256Hex.empty() &&
              download.expectedSha256Hex != incoming.sha256Hex) ||
@@ -722,6 +769,10 @@ ProbeResult ProbeUrl(const std::wstring& url) {
         if (status >= 200 && status < 300) {
             const HttpDigestValues headDigests = ParseHttpDigestValues(
                 QueryCustomHeader(head->request, L"Repr-Digest"));
+            if (headDigests.HasInvalid()) {
+                result.error = BuildMalformedDigestError(headDigests, L"Repr-Digest");
+                return result;
+            }
             result.representationSha256Hex = headDigests.sha256Hex;
             result.representationSha512Hex = headDigests.sha512Hex;
         }
@@ -998,7 +1049,7 @@ RangeResult DownloadRange(Download& download, const std::shared_ptr<Mirror>& mir
 
     const HttpDigestValues rangeDigests = ParseHttpDigestValues(
         QueryCustomHeader(response->request, L"Repr-Digest"));
-    if (!rangeDigests.sha256Hex.empty() || !rangeDigests.sha512Hex.empty()) {
+    if (rangeDigests.HasInvalid() || !rangeDigests.sha256Hex.empty() || !rangeDigests.sha512Hex.empty()) {
         std::lock_guard digestLock(download.mutex);
         if (!AcceptResponseDigestLocked(download, *mirror, rangeDigests,
                                         L"Repr-Digest", result.error)) {
@@ -1137,6 +1188,10 @@ FullResult DownloadFull(Download& download, const std::shared_ptr<Mirror>& mirro
     HttpDigestValues fullResponseDigests = ParseHttpDigestValues(
         QueryCustomHeader(response->request, L"Repr-Digest"));
     const wchar_t* digestHeaderSource = L"Repr-Digest";
+    if (fullResponseDigests.HasInvalid()) {
+        result.error = BuildMalformedDigestError(fullResponseDigests, digestHeaderSource);
+        return result;
+    }
     if (fullResponseDigests.sha256Hex.empty() && fullResponseDigests.sha512Hex.empty()) {
         const std::wstring contentEncoding = QueryCustomHeader(response->request, L"Content-Encoding");
         if (contentEncoding.empty() || _wcsicmp(contentEncoding.c_str(), L"identity") == 0) {
@@ -1144,6 +1199,10 @@ FullResult DownloadFull(Download& download, const std::shared_ptr<Mirror>& mirro
                 QueryCustomHeader(response->request, L"Content-Digest"));
             digestHeaderSource = L"Content-Digest";
         }
+    }
+    if (fullResponseDigests.HasInvalid()) {
+        result.error = BuildMalformedDigestError(fullResponseDigests, digestHeaderSource);
+        return result;
     }
     if (!fullResponseDigests.sha256Hex.empty() || !fullResponseDigests.sha512Hex.empty()) {
         std::lock_guard digestLock(download.mutex);

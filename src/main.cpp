@@ -1318,6 +1318,9 @@ std::wstring GetDownloadStatusTextLocked(const Download& download) {
         return L"Checksum mismatch — data kept";
     if (status.find(L"Checksum verification failed") != std::wstring::npos)
         return L"Checksum check failed — data kept";
+    if (error.find(L"malformed supported SHA-") != std::wstring::npos ||
+        status.find(L"malformed supported SHA-") != std::wstring::npos)
+        return L"Server digest invalid — see details";
     if (status.find(L"File size mismatch") != std::wstring::npos)
         return L"File size mismatch — data kept";
     if (download.phase == DownloadPhase::Paused) return L"Paused";
@@ -1340,6 +1343,14 @@ std::wstring GetDownloadStatusTextLocked(const Download& download) {
         if (statusHas(L"Waiting for mirror checks")) return L"Checking mirrors";
         return L"Downloading (sequential)";
     case DownloadPhase::Completed:
+        if (!download.expectedSha256Hex.empty() && !download.expectedSha512Hex.empty())
+            return L"Completed — SHA-256 + SHA-512 verified";
+        if (!download.expectedSha256Hex.empty())
+            return L"Completed — SHA-256 verified";
+        if (!download.expectedSha512Hex.empty())
+            return L"Completed — SHA-512 verified";
+        if (download.integrityStatusText.find(L"server did not provide a supported full-file digest") != std::wstring::npos)
+            return L"Completed — checksum unavailable";
         return L"Completed";
     case DownloadPhase::CancelledKept:
         return L"Cancelled — partial saved";
@@ -2658,7 +2669,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         AddColumn(g_mainList, 2, L"Downloaded / size", 175);
         AddColumn(g_mainList, 3, L"Speed", 105);
         AddColumn(g_mainList, 4, L"ETA (avg)", 95);
-        AddColumn(g_mainList, 5, L"Status", 210);
+        AddColumn(g_mainList, 5, L"Status", 270);
         g_statusText = CreateLabel(hwnd, L"Ready", 22, 608, 900, 22);
         g_clearCompletedButton = CreateDarkButton(hwnd, L"Clear completed", ID_CLEAR_COMPLETED, 0, 0, 120, 30);
         RECT initialClient{};
