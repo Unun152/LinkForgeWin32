@@ -56,6 +56,13 @@ enum class RetryResult {
     Failed
 };
 
+enum class ModeSwitchResult {
+    Started,
+    ConfirmationRequired,
+    NotAvailable,
+    Failed
+};
+
 struct Mirror {
     int id = 0;
     std::wstring url;
@@ -150,6 +157,8 @@ public:
     bool IsRunning() const;
     void Join();
     RetryResult Retry(bool confirmRestart, std::wstring& message);
+    ModeSwitchResult SwitchMode(bool targetSingleMirrorOnly, bool confirmed,
+                                bool keepExistingData, std::wstring& message);
     void AddMirrors(const std::vector<std::wstring>& urls);
     bool RemoveMirror(int mirrorId);
 
@@ -231,7 +240,7 @@ private:
     bool RunFallback(); // true means success
     bool PrepareParallelFile(std::wstring& error);
     bool FinalizeFile(std::wstring& error);
-    void CleanupPartFile();
+    bool CleanupPartFile(std::wstring& error);
     void PreservePartialFile();
     void FinishCancelled();
     void ProbeInitialMirrors();

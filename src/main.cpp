@@ -26,6 +26,7 @@ using linkforge::Download;
 using linkforge::DownloadPhase;
 using linkforge::Mirror;
 using linkforge::RetryResult;
+using linkforge::ModeSwitchResult;
 using linkforge::Segment;
 
 namespace {
@@ -59,6 +60,7 @@ constexpr int ID_DETAIL_ADD = 3002;
 constexpr int ID_DETAIL_REMOVE = 3003;
 constexpr int ID_DETAIL_CLOSE = 3004;
 constexpr int ID_DETAIL_RETRY = 3005;
+constexpr int ID_DETAIL_SWITCH_MODE = 3006;
 
 constexpr int ID_SETTINGS_MAX_TOTAL = 4001;
 constexpr int ID_SETTINGS_MAX_PER_MIRROR = 4002;
@@ -129,6 +131,7 @@ struct DetailsContext {
     HWND addButton = nullptr;
     HWND removeButton = nullptr;
     HWND retryButton = nullptr;
+    HWND switchModeButton = nullptr;
     HWND closeButton = nullptr;
 };
 
@@ -1008,6 +1011,8 @@ void RefreshDetails(DetailsContext* context) {
     std::wstring summary;
     bool terminal = false;
     bool canRetry = false;
+    bool canSwitchMode = false;
+    bool singleMirrorOnly = false;
     uint64_t averageEndTick = 0;
     {
         std::lock_guard lock(download->mutex);
@@ -1016,41 +1021,43 @@ void RefreshDetails(DetailsContext* context) {
         averageEndTick = download->endTransferTick ? download->endTransferTick : now;
         const double averageSpeedBps = GetAverageTransferSpeedLocked(*download, now);
         const std::wstring average = averageSpeedBps >= 1.0 ? FormatSpeed(averageSpeedBps) : L"—";
-        const size_t activeMirrors = static_cast<size_t>(std::count_if(download->mirrors.begin(), download->mirrors.end(),
-            [](const auto& mirror) { return mirror->active; }));
-        const size_t partialChunks = static_cast<size_t>(std::count_if(download->segments.begin(), download->segments.end(),
-            [](const Segment& segment) { return segment.state != 2 && segment.committedBytes > 0; }));
         const uint64_t chunkBytes = download->persistentSegmentBytes ? download->persistentSegmentBytes : download->restoredSegmentBytes;
         const std::wstring chunkSizeText = chunkBytes ? FormatBytes(chunkBytes) : L"not set";
-        std::wstring shortStatus = download->statusText;
+        std::wstring shortStatus = download->lastError.empty() ? download->statusText : download->lastError;
         // Normal transfer-state text repeats the selected mode shown on the first row.
         if (shortStatus == L"Downloading with parallel byte ranges" ||
             shortStatus == L"Downloading from one mirror at a time" ||
             shortStatus == L"Downloading from mirror") {
             shortStatus.clear();
-        } else if (shortStatus.size() > 30) {
-            shortStatus = shortStatus.substr(0, 27) + L"...";
+        } else if (shortStatus.size() > 48) {
+            shortStatus = shortStatus.substr(0, 45) + L"...";
         }
         const std::wstring summaryFirstRow =
-            L"Mirrors: " + std::to_wstring(activeMirrors) + L"/" + std::to_wstring(download->mirrors.size()) + L" active" +
+            L"Mirrors: " + std::to_wstring(download->activeRequests) + L"/" + std::to_wstring(download->mirrors.size()) +
             L"   ·   " + (download->singleMirrorOnly ? L"Mode: Single mirror" : L"Mode: Parallel") +
             L"   ·   Chunk: " + chunkSizeText +
             L"   ·   Chunks: " + std::to_wstring(download->completedSegments) + L"/" + std::to_wstring(download->segments.size()) + L" complete";
         const std::wstring summarySecondRow =
-            L"Active: " + std::to_wstring(download->activeRequests) + L"   ·   Partial: " + std::to_wstring(partialChunks) +
-            L"   ·   Progress: " + GetProgressTextLocked(*download) + L" (" + GetSizeTextLocked(*download) + L")" +
+            L"Progress: " + GetProgressTextLocked(*download) + L" (" + GetSizeTextLocked(*download) + L")" +
             L"   ·   Current: " + FormatSpeed(download->speedBps) + L"   ·   Avg: " + average +
             (shortStatus.empty() ? std::wstring() : L"   ·   Status: " + shortStatus);
         summary = summaryFirstRow + L"\r\n" + summarySecondRow;
         terminal = download->terminal;
         canRetry = download->phase == DownloadPhase::Failed || download->phase == DownloadPhase::Cancelled ||
                    download->phase == DownloadPhase::CancelledKept;
+        canSwitchMode = canRetry;
+        singleMirrorOnly = download->singleMirrorOnly;
     }
     SetWindowTextW(context->summaryLabel, summary.c_str());
     const auto currentSettings = linkforge::GetSettings();
     EnableWindow(context->addButton, !terminal || canRetry);
     EnableWindow(context->removeButton, !terminal);
     EnableWindow(context->retryButton, canRetry);
+    if (context->switchModeButton) {
+        SetWindowTextW(context->switchModeButton,
+                       singleMirrorOnly ? L"Switch to parallel" : L"Switch to sequential");
+        EnableWindow(context->switchModeButton, canSwitchMode);
+    }
 
     if (ListView_GetItemCount(context->list) != static_cast<int>(mirrors.size())) {
         int selectedId = -1;
@@ -1451,6 +1458,37 @@ void RetryDownloadWithConfirmation(HWND owner, const std::shared_ptr<Download>& 
     }
 }
 
+void SwitchDownloadModeWithConfirmation(HWND owner, const std::shared_ptr<Download>& download) {
+    if (!download) return;
+    bool targetSingleMirrorOnly = false;
+    {
+        std::lock_guard lock(download->mutex);
+        if (download->phase != DownloadPhase::Failed && download->phase != DownloadPhase::Cancelled &&
+            download->phase != DownloadPhase::CancelledKept) return;
+        targetSingleMirrorOnly = !download->singleMirrorOnly;
+    }
+
+    std::wstring message;
+    ModeSwitchResult result = download->SwitchMode(targetSingleMirrorOnly, false, false, message);
+    if (result == ModeSwitchResult::ConfirmationRequired) {
+        const int choice = MessageBoxW(owner, message.c_str(), L"Switch download mode",
+                                       MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
+        if (choice != IDYES && choice != IDNO) return;
+        message.clear();
+        result = download->SwitchMode(targetSingleMirrorOnly, true, choice == IDYES, message);
+    }
+
+    if (result == ModeSwitchResult::Failed || result == ModeSwitchResult::NotAvailable) {
+        if (!message.empty())
+            MessageBoxW(owner, message.c_str(), L"Could not switch download mode", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (result == ModeSwitchResult::Started) {
+        PersistDownloadsToFile();
+        UpdateMainList();
+    }
+}
+
 void RemoveSelectedMirror(DetailsContext* context) {
     if (!context) return;
     const int row = ListView_GetNextItem(context->list, -1, LVNI_SELECTED);
@@ -1504,6 +1542,7 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         context->addButton = CreateDarkButton(hwnd, L"＋ Add mirrors", ID_DETAIL_ADD, 18, 490, 138, 34);
         context->removeButton = CreateDarkButton(hwnd, L"Remove mirror", ID_DETAIL_REMOVE, 164, 490, 130, 34);
         context->retryButton = CreateDarkButton(hwnd, L"Retry download", ID_DETAIL_RETRY, 302, 490, 130, 34);
+        context->switchModeButton = CreateDarkButton(hwnd, L"Switch mode", ID_DETAIL_SWITCH_MODE, 440, 490, 158, 34);
         context->closeButton = CreateDarkButton(hwnd, L"Close", ID_DETAIL_CLOSE, 916, 490, 130, 34);
         RefreshDetails(context);
         SetTimer(hwnd, kUiTimer, 500, nullptr);
@@ -1527,6 +1566,7 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         MoveWindow(context->addButton, 18, height - 58, 138, 34, TRUE);
         MoveWindow(context->removeButton, 164, height - 58, 130, 34, TRUE);
         MoveWindow(context->retryButton, 302, height - 58, 130, 34, TRUE);
+        MoveWindow(context->switchModeButton, 440, height - 58, 158, 34, TRUE);
         MoveWindow(context->closeButton, width - 148, height - 58, 130, 34, TRUE);
         break;
     }
@@ -1551,6 +1591,10 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return 0;
         case ID_DETAIL_RETRY:
             RetryDownloadWithConfirmation(hwnd, context->download);
+            RefreshDetails(context);
+            return 0;
+        case ID_DETAIL_SWITCH_MODE:
+            SwitchDownloadModeWithConfirmation(hwnd, context->download);
             RefreshDetails(context);
             return 0;
         case ID_DETAIL_CLOSE:
