@@ -25,6 +25,7 @@
 using linkforge::Download;
 using linkforge::DownloadPhase;
 using linkforge::Mirror;
+using linkforge::RetryResult;
 using linkforge::Segment;
 
 namespace {
@@ -1420,6 +1421,36 @@ void OpenDetails(HWND owner, const std::shared_ptr<Download>& download) {
     UpdateWindow(hwnd);
 }
 
+
+void RetryDownloadWithConfirmation(HWND owner, const std::shared_ptr<Download>& download) {
+    if (!download) return;
+    {
+        std::lock_guard lock(download->mutex);
+        if (download->phase != DownloadPhase::Failed && download->phase != DownloadPhase::Cancelled &&
+            download->phase != DownloadPhase::CancelledKept) return;
+    }
+
+    std::wstring message;
+    RetryResult result = download->Retry(false, message);
+    if (result == RetryResult::ConfirmationRequired) {
+        const int choice = MessageBoxW(owner, message.c_str(), L"Confirm download retry",
+                                       MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (choice != IDYES) return;
+        message.clear();
+        result = download->Retry(true, message);
+    }
+
+    if (result == RetryResult::Failed) {
+        if (!message.empty())
+            MessageBoxW(owner, message.c_str(), L"Retry failed", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (result == RetryResult::Started) {
+        PersistDownloadsToFile();
+        UpdateMainList();
+    }
+}
+
 void RemoveSelectedMirror(DetailsContext* context) {
     if (!context) return;
     const int row = ListView_GetNextItem(context->list, -1, LVNI_SELECTED);
@@ -1519,7 +1550,7 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             RemoveSelectedMirror(context);
             return 0;
         case ID_DETAIL_RETRY:
-            context->download->Retry();
+            RetryDownloadWithConfirmation(hwnd, context->download);
             RefreshDetails(context);
             return 0;
         case ID_DETAIL_CLOSE:
@@ -1931,19 +1962,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             return 0;
         }
         case ID_RETRY: {
-            auto download = GetSelectedDownload();
-            if (download) {
-                bool retryable = false;
-                {
-                    std::lock_guard lock(download->mutex);
-                    retryable = download->phase == DownloadPhase::Failed || download->phase == DownloadPhase::Cancelled ||
-                                download->phase == DownloadPhase::CancelledKept;
-                }
-                if (retryable) {
-                    download->Retry();
-                    PersistDownloadsToFile();
-                }
-            }
+            RetryDownloadWithConfirmation(hwnd, GetSelectedDownload());
             return 0;
         }
         case ID_REMOVE: {

@@ -12,6 +12,7 @@
 #include <limits>
 #include <sstream>
 #include <utility>
+#include <winioctl.h>
 
 namespace linkforge {
 namespace {
@@ -1192,8 +1193,7 @@ Download::Download(const std::wstring& folder, const std::wstring& name,
         restoredCompletedSegmentIndices = resume->completedSegmentIndices;
         restoredPartialSegmentBytes = resume->partialSegmentBytes;
         singleMirrorOnly = resume->singleMirrorOnly;
-        restorePending = resume->segmentBytes > 0 &&
-            (!resume->completedSegmentIndices.empty() || !resume->partialSegmentBytes.empty());
+        restorePending = resume->segmentBytes > 0 && resume->totalSize > 0;
         resumeFallbackPending = resume->resumeFallbackPending;
         resumeFallbackMirrorUrl = resume->resumeFallbackMirrorUrl;
         if (resume->wasCompleted) {
@@ -1342,8 +1342,12 @@ void Download::Resume() {
     }
     cv.notify_all();
     if (shouldStart) {
-        if (shouldRetry) Retry();
-        else Start();
+        if (shouldRetry) {
+            std::wstring confirmationMessage;
+            Retry(false, confirmationMessage);
+        } else {
+            Start();
+        }
     } else {
         for (const auto& mirror : pendingProbes) SpawnProbeThread(mirror);
     }
@@ -1374,62 +1378,164 @@ void Download::Join() {
     JoinAuxiliaryThreads();
 }
 
-void Download::Retry() {
+RetryResult Download::Retry(bool confirmRestart, std::wstring& message) {
+    message.clear();
+    {
+        std::lock_guard lock(mutex);
+        if (phase != DownloadPhase::Failed && phase != DownloadPhase::Cancelled &&
+            phase != DownloadPhase::CancelledKept) return RetryResult::NotRetryable;
+    }
+
     Join();
     {
         std::lock_guard lock(mutex);
         if (phase != DownloadPhase::Failed && phase != DownloadPhase::Cancelled &&
-            phase != DownloadPhase::CancelledKept) return;
+            phase != DownloadPhase::CancelledKept) return RetryResult::NotRetryable;
 
-        bool keepExisting = false;
-        std::error_code ec;
-        keepExisting = !partPath.empty() && std::filesystem::exists(std::filesystem::path(partPath), ec) && !ec;
-        // A restored job has not rebuilt its Segment array yet. Preserve the saved
-        // completed-range indices instead of clearing them when the user presses Retry.
-        std::vector<uint64_t> savedCompletedIndices = restoredCompletedSegmentIndices;
-        std::vector<std::pair<uint64_t, uint64_t>> savedPartialSegments = restoredPartialSegmentBytes;
-        restoredCompletedSegmentIndices.clear();
-        restoredPartialSegmentBytes.clear();
-        if (keepExisting && persistentSegmentBytes > 0 && totalSize > 0) {
+        bool partExists = false;
+        uint64_t partFileSize = 0;
+        std::error_code fileError;
+        if (!partPath.empty()) {
+            partExists = std::filesystem::exists(std::filesystem::path(partPath), fileError);
+            if (fileError) {
+                message = L"Could not inspect the existing partial file. It has been left untouched. Windows/filesystem error: " +
+                          std::to_wstring(fileError.value());
+                lastError = message;
+                statusText = L"Retry stopped - could not inspect partial file";
+                return RetryResult::Failed;
+            }
+            if (partExists) {
+                partFileSize = std::filesystem::file_size(std::filesystem::path(partPath), fileError);
+                if (fileError) {
+                    message = L"Could not read the existing partial file size. The file and saved resume information have been left untouched. Windows/filesystem error: " +
+                              std::to_wstring(fileError.value());
+                    lastError = message;
+                    statusText = L"Retry stopped - could not inspect partial file";
+                    return RetryResult::Failed;
+                }
+            }
+        }
+
+        // Prefer the current in-memory layout. A restored job may not have rebuilt
+        // its Segment array yet, so use the layout loaded from the queue in that case.
+        uint64_t mapTotalSize = 0;
+        uint64_t mapSegmentBytes = 0;
+        if (!segments.empty() && persistentSegmentBytes > 0 && totalSize > 0) {
+            mapTotalSize = totalSize;
+            mapSegmentBytes = persistentSegmentBytes;
+        } else if (restoredSegmentBytes > 0 && restoredTotalSize > 0) {
+            mapTotalSize = restoredTotalSize;
+            mapSegmentBytes = restoredSegmentBytes;
+        } else if (persistentSegmentBytes > 0 && totalSize > 0) {
+            mapTotalSize = totalSize;
+            mapSegmentBytes = persistentSegmentBytes;
+        }
+
+        const bool hasSavedMapLayout = mapSegmentBytes > 0 && mapTotalSize > 0;
+        const bool canResumeSavedMap = hasSavedMapLayout && partExists && partFileSize == mapTotalSize;
+        const bool hasPartialFileData = partExists && partFileSize > 0;
+        const bool hasSavedChunkEntries = !restoredCompletedSegmentIndices.empty() ||
+                                          !restoredPartialSegmentBytes.empty();
+
+        // A layout with zero completed/partial chunks is still a valid empty map:
+        // all ranges simply need to be downloaded again. Do not archive its full-size
+        // preallocated working file as a huge, useless .partial backup.
+        const bool needsRestartConfirmation = !canResumeSavedMap &&
+            (hasSavedMapLayout || hasSavedChunkEntries || hasPartialFileData);
+        if (needsRestartConfirmation && !confirmRestart) {
+            if (hasSavedMapLayout && !partExists) {
+                message =
+                    L"LinkForge found saved parallel chunk information, but the working .part file is missing. "
+                    L"The saved chunks cannot be reused without that file. Continuing will discard the saved chunk map "
+                    L"and restart the download from byte zero. There is no existing partial file to delete.\n\n"
+                    L"Continue with Retry?";
+            } else if (hasSavedMapLayout && partExists) {
+                if (hasPartialFileData) {
+                    message =
+                        L"The saved parallel chunk map does not match the current .part file size. LinkForge cannot safely "
+                        L"resume those byte ranges. Continuing will preserve the existing file under a unique .partial "
+                        L"backup name, discard the unusable chunk map, and restart from byte zero. The existing file will "
+                        L"not be deleted.\n\nContinue with Retry?";
+                } else {
+                    message =
+                        L"The saved parallel chunk map does not match the current empty .part file. LinkForge cannot "
+                        L"apply the saved chunks to it. Continuing will discard the unusable chunk map and reuse this "
+                        L"empty file for a fresh download from byte zero. No downloaded file contents will be deleted.\n\n"
+                        L"Continue with Retry?";
+                }
+            } else if (singleMirrorOnly) {
+                message =
+                    L"This is a sequential, single-mirror download and it has no resumable parallel chunk map. "
+                    L"LinkForge cannot safely continue the existing partial response from its current byte offset. "
+                    L"Continuing will preserve any non-empty partial file as a .partial backup and start a new full-file "
+                    L"request. The existing file will not be deleted.\n\nContinue with Retry?";
+            } else if (hasPartialFileData) {
+                message =
+                    L"LinkForge does not have a usable saved parallel chunk map for this partial file. Without the map, "
+                    L"it cannot know which byte ranges were fully downloaded and safely committed. Continuing will "
+                    L"preserve the existing file under a unique .partial backup name, create a new working file, and "
+                    L"restart from byte zero. The existing file will not be deleted.\n\nContinue with Retry?";
+            } else {
+                message =
+                    L"LinkForge has saved chunk entries but no usable chunk layout or partial data file. "
+                    L"The saved chunk information cannot be applied. Continuing will discard those saved offsets and "
+                    L"restart the download from byte zero. No existing file contents will be deleted.\n\n"
+                    L"Continue with Retry?";
+            }
+            return RetryResult::ConfirmationRequired;
+        }
+
+        // Preserve the saved chunk map even when it contains zero completed ranges.
+        if (canResumeSavedMap) {
+            std::vector<uint64_t> savedCompletedIndices;
+            std::vector<std::pair<uint64_t, uint64_t>> savedPartialSegments;
             if (!segments.empty()) {
                 for (size_t index = 0; index < segments.size(); ++index) {
                     const Segment& segment = segments[index];
-                    if (segment.state == 2) restoredCompletedSegmentIndices.push_back(index);
-                    else if (segment.committedBytes > 0) restoredPartialSegmentBytes.emplace_back(index, segment.committedBytes);
+                    if (segment.state == 2) savedCompletedIndices.push_back(index);
+                    else if (segment.committedBytes > 0)
+                        savedPartialSegments.emplace_back(index, segment.committedBytes);
                 }
             } else {
-                restoredCompletedSegmentIndices = std::move(savedCompletedIndices);
-                restoredPartialSegmentBytes = std::move(savedPartialSegments);
+                savedCompletedIndices = restoredCompletedSegmentIndices;
+                savedPartialSegments = restoredPartialSegmentBytes;
             }
-            restoredTotalSize = totalSize;
-            restoredSegmentBytes = persistentSegmentBytes;
-            restorePending = !restoredCompletedSegmentIndices.empty() || !restoredPartialSegmentBytes.empty();
+            restoredCompletedSegmentIndices = std::move(savedCompletedIndices);
+            restoredPartialSegmentBytes = std::move(savedPartialSegments);
+            restoredTotalSize = mapTotalSize;
+            restoredSegmentBytes = mapSegmentBytes;
+            persistentSegmentBytes = mapSegmentBytes;
+            restorePending = true;
+            sizeKnown = true;
+            totalSize = mapTotalSize;
         } else {
-            // No trustworthy chunk map is available. Preserve any existing data
-            // under a unique .partial name rather than silently deleting it.
-            if (keepExisting) {
+            // If the map is unavailable or its file no longer matches, archive
+            // non-empty bytes rather than deleting or overwriting them.
+            if (hasPartialFileData) {
                 std::wstring archivedPath, archiveError;
                 if (!ArchiveNonEmptyPartialFile(partPath, finalPath, archivedPath, archiveError)) {
-                    // Restore the saved resume map before returning. The original
-                    // file is still at partPath and remains the source for these offsets.
-                    restoredCompletedSegmentIndices = std::move(savedCompletedIndices);
-                    restoredPartialSegmentBytes = std::move(savedPartialSegments);
                     lastError = archiveError;
                     statusText = L"Retry stopped - existing partial data preserved";
-                    return;
+                    message = archiveError;
+                    return RetryResult::Failed;
                 }
                 if (!archivedPath.empty()) {
                     preservedPartialPaths.push_back(archivedPath);
                     partialPath = archivedPath;
                 }
             }
+
             restorePending = false;
             restoredTotalSize = 0;
             restoredSegmentBytes = 0;
+            restoredReferencePrefixHash = 0;
+            restoredReferenceMiddleHash = 0;
+            restoredReferenceSuffixHash = 0;
             restoredPartialSegmentBytes.clear();
             restoredCompletedSegmentIndices.clear();
             persistentSegmentBytes = 0;
-            partPath = finalPath + L".linkforge.part";
+            sizeKnown = false;
+            totalSize = 0;
         }
 
         cancelRequested.store(false);
@@ -1446,9 +1552,6 @@ void Download::Retry() {
         phase = DownloadPhase::Queued;
         statusText = L"Queued for retry";
         lastError.clear();
-        sizeKnown = keepExisting && restoredTotalSize > 0;
-        if (sizeKnown) totalSize = restoredTotalSize;
-        else totalSize = 0;
         completedBytes = fallbackBytes = networkBytes = 0;
         firstTransferTick = endTransferTick = 0;
         speedBps = 0;
@@ -1507,6 +1610,7 @@ void Download::Retry() {
         }
     }
     Start();
+    return RetryResult::Started;
 }
 
 void Download::AddMirrors(const std::vector<std::wstring>& urls) {
@@ -1816,14 +1920,52 @@ void Download::ProbeInitialMirrors() {
 bool Download::PrepareParallelFile(std::wstring& error) {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(outputFolder), ec);
+    if (ec) {
+        error = L"Could not create the output directory: " + std::to_wstring(ec.value());
+        return false;
+    }
 
-    bool fileExisted = std::filesystem::exists(std::filesystem::path(partPath), ec) && !ec;
+    ec.clear();
+    bool fileExisted = std::filesystem::exists(std::filesystem::path(partPath), ec);
+    if (ec) {
+        error = L"Could not inspect the existing partial file: " + std::to_wstring(ec.value());
+        return false;
+    }
 
     // A pause stops and joins the current worker pool. When the manager wakes after
     // Resume, it calls RunParallel again. Keep the in-memory chunk table and offsets
     // in that case; rebuilding it here would erase the progress from the current run.
     {
         std::lock_guard lock(mutex);
+        if (restorePending) {
+            if (restoredSegmentBytes == 0 || restoredTotalSize == 0) {
+                error = L"The saved parallel chunk map is incomplete; refusing to discard it.";
+                return false;
+            }
+            if (!fileExisted) {
+                error = L"The saved parallel chunk map exists, but its partial download file is missing; refusing to reset the saved chunks.";
+                return false;
+            }
+            if (restoredTotalSize != totalSize) {
+                const bool hasSavedRanges = !restoredCompletedSegmentIndices.empty() ||
+                                            !restoredPartialSegmentBytes.empty();
+                if (hasSavedRanges) {
+                    error = L"The saved parallel chunk map refers to a different file size; leaving the partial file and saved chunks unchanged.";
+                    return false;
+                }
+                // No range is trusted as complete. The source size changed, so archive
+                // the old working file below and build a fresh empty segment layout.
+                restorePending = false;
+                restoredTotalSize = 0;
+                restoredSegmentBytes = 0;
+                restoredReferencePrefixHash = 0;
+                restoredReferenceMiddleHash = 0;
+                restoredReferenceSuffixHash = 0;
+                restoredCompletedSegmentIndices.clear();
+                restoredPartialSegmentBytes.clear();
+                persistentSegmentBytes = 0;
+            }
+        }
         if (!segments.empty() && persistentSegmentBytes > 0) {
             if (!fileExisted) {
                 error = L"The partial download file is missing; refusing to reset completed chunks";
@@ -1853,8 +1995,11 @@ bool Download::PrepareParallelFile(std::wstring& error) {
     {
         std::lock_guard lock(mutex);
         sizeToPrepare = totalSize;
-        useRestore = restorePending && restoredTotalSize == totalSize && fileExisted && restoredSegmentBytes > 0 &&
-            (!restoredCompletedSegmentIndices.empty() || !restoredPartialSegmentBytes.empty());
+        useRestore = restorePending && restoredTotalSize == totalSize && fileExisted && restoredSegmentBytes > 0;
+        if (restorePending && !useRestore) {
+            error = L"The saved parallel chunk map cannot be applied to the existing partial file; leaving both unchanged.";
+            return false;
+        }
         if (useRestore) {
             chosenSegmentBytes = restoredSegmentBytes;
             completedIndices = restoredCompletedSegmentIndices;
@@ -1863,7 +2008,7 @@ bool Download::PrepareParallelFile(std::wstring& error) {
 
     HANDLE file = CreateFileW(partPath.c_str(), GENERIC_READ | GENERIC_WRITE,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              fileExisted ? OPEN_EXISTING : CREATE_ALWAYS,
+                              fileExisted ? OPEN_EXISTING : CREATE_NEW,
                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         error = L"Could not open partial file: " + std::to_wstring(GetLastError());
@@ -1897,7 +2042,7 @@ bool Download::PrepareParallelFile(std::wstring& error) {
             partialPath = archivedPath;
         }
         file = CreateFileW(partPath.c_str(), GENERIC_READ | GENERIC_WRITE,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_NEW,
                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
         if (file == INVALID_HANDLE_VALUE) {
             error = L"Could not create a fresh partial file after preserving the old one: " +
@@ -1905,6 +2050,17 @@ bool Download::PrepareParallelFile(std::wstring& error) {
             return false;
         }
     }
+    LARGE_INTEGER currentFileSize{};
+    if (GetFileSizeEx(file, &currentFileSize) && currentFileSize.QuadPart == 0) {
+        FILE_SET_SPARSE_BUFFER sparseInfo{};
+        sparseInfo.SetSparse = TRUE;
+        DWORD bytesReturned = 0;
+        // Sparse files are an optional disk-space optimization. Filesystems without
+        // sparse-file support retain the previous preallocation behavior.
+        DeviceIoControl(file, FSCTL_SET_SPARSE, &sparseInfo, sizeof(sparseInfo),
+                        nullptr, 0, &bytesReturned, nullptr);
+    }
+
     LARGE_INTEGER size{};
     size.QuadPart = static_cast<LONGLONG>(sizeToPrepare);
     if (!SetFilePointerEx(file, size, nullptr, FILE_BEGIN) || !SetEndOfFile(file) || !FlushFileBuffers(file)) {
@@ -2433,9 +2589,10 @@ void Download::Run() {
     bool restoredDataMismatch = false;
     {
         std::lock_guard lock(mutex);
-        if (restorePending) {
+        if (restorePending &&
+            (!restoredCompletedSegmentIndices.empty() || !restoredPartialSegmentBytes.empty())) {
             // A missing/failed range probe does not prove that the source changed.
-            // Keep the saved offsets until a range-capable mirror can be sampled.
+            // Keep saved offsets until a range-capable mirror can be sampled.
             if (!rangeReferenceReady || !referenceSizeKnown || totalSize == 0) {
                 restoredDataUnverified = true;
             } else {

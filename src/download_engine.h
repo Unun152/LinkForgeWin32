@@ -49,6 +49,13 @@ enum class DownloadPhase {
     Paused
 };
 
+enum class RetryResult {
+    Started,
+    ConfirmationRequired,
+    NotRetryable,
+    Failed
+};
+
 struct Mirror {
     int id = 0;
     std::wstring url;
@@ -142,7 +149,7 @@ public:
     bool IsPaused() const;
     bool IsRunning() const;
     void Join();
-    void Retry();
+    RetryResult Retry(bool confirmRestart, std::wstring& message);
     void AddMirrors(const std::vector<std::wstring>& urls);
     bool RemoveMirror(int mirrorId);
 
