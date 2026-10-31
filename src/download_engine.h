@@ -128,6 +128,9 @@ struct DownloadResumeState {
     bool wasCancelled = false;
     bool wasCancelledKept = false;
     bool wasPaused = false;
+    // Preserve the last useful failure state and diagnostic across application restarts.
+    std::wstring statusText;
+    std::wstring lastError;
 };
 
 struct Segment {

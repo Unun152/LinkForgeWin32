@@ -1273,7 +1273,8 @@ Download::Download(const std::wstring& folder, const std::wstring& name,
             completedBytes = totalSize;
         } else if (resume->wasFailed) {
             phase = DownloadPhase::Failed;
-            statusText = L"Failed (restored)";
+            statusText = resume->statusText.empty() ? L"Failed (restored)" : resume->statusText;
+            lastError = resume->lastError;
             terminal = true;
         } else if (resume->wasPaused) {
             phase = DownloadPhase::Paused;
@@ -3166,6 +3167,10 @@ void Download::RunInternal() {
             }
 
             if (complete) {
+                {
+                    std::lock_guard statusLock(mutex);
+                    statusText = L"Finalizing file";
+                }
                 std::wstring error;
                 if (FinalizeFile(error)) {
                     SetStatus(*this, DownloadPhase::Completed, L"Completed");

@@ -136,6 +136,7 @@ struct DetailsContext {
     HWND list = nullptr;
     HWND tooltip = nullptr;
     std::wstring tooltipText;
+    std::wstring summaryTooltipText;
     HWND addButton = nullptr;
     HWND removeButton = nullptr;
     HWND retryButton = nullptr;
@@ -258,6 +259,16 @@ std::wstring ReadStateString(const wchar_t* section, const std::wstring& key, co
 bool WriteStateString(const std::wstring& file, const wchar_t* section,
                       const std::wstring& key, const std::wstring& value) {
     return WritePrivateProfileStringW(section, key.c_str(), value.c_str(), file.c_str()) != FALSE;
+}
+
+std::wstring MakeIniSingleLine(const std::wstring& value) {
+    std::wstring result = value;
+    for (wchar_t& character : result) {
+        if (character == L'\r' || character == L'\n') character = L' ';
+    }
+    // ReadStateString uses a 32K buffer. Keep room for its terminator.
+    if (result.size() > 30000) result.resize(30000);
+    return result;
 }
 
 std::vector<uint64_t> ParseIndexList(const std::wstring& text) {
@@ -676,7 +687,7 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         std::vector<std::wstring> urls;
         std::vector<uint64_t> completedSegments;
         std::vector<std::pair<uint64_t, uint64_t>> partialSegments;
-        std::wstring folder, filename, finalPath, partPath, phaseName;
+        std::wstring folder, filename, finalPath, partPath, phaseName, statusText, lastError;
         uint64_t totalSize = 0, segmentBytes = 0;
         uint64_t prefixHash = 0, middleHash = 0, suffixHash = 0;
         bool sizeKnown = false, userPaused = false, completed = false, failed = false, cancelled = false;
@@ -690,6 +701,8 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
             filename = download->fileName;
             finalPath = download->finalPath;
             partPath = download->partPath;
+            statusText = download->statusText;
+            lastError = download->lastError;
             totalSize = download->totalSize;
             sizeKnown = download->sizeKnown;
             segmentBytes = download->persistentSegmentBytes ? download->persistentSegmentBytes : download->restoredSegmentBytes;
@@ -763,6 +776,8 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         // .partial files are never written to or restored from queue state.
         ok &= WriteStateString(tempPath, section.c_str(), L"PartPath", partPath);
         ok &= WriteStateString(tempPath, section.c_str(), L"Phase", phaseName);
+        ok &= WriteStateString(tempPath, section.c_str(), L"StatusText", MakeIniSingleLine(statusText));
+        ok &= WriteStateString(tempPath, section.c_str(), L"LastError", MakeIniSingleLine(lastError));
         ok &= WriteStateString(tempPath, section.c_str(), L"SizeKnown", sizeKnown ? L"1" : L"0");
         ok &= WriteStateString(tempPath, section.c_str(), L"TotalSize", std::to_wstring(totalSize));
         ok &= WriteStateString(tempPath, section.c_str(), L"SegmentBytes", std::to_wstring(segmentBytes));
@@ -860,6 +875,8 @@ void LoadDownloadsFromFile() {
         // The constructor accepts this only when it ends in .linkforge.part.
         // Legacy .partial paths are intentionally ignored and never touched.
         resume.partPath = ReadStateString(section.c_str(), L"PartPath", g_downloadsStatePath);
+        resume.statusText = ReadStateString(section.c_str(), L"StatusText", g_downloadsStatePath);
+        resume.lastError = ReadStateString(section.c_str(), L"LastError", g_downloadsStatePath);
         resume.sizeKnown = GetPrivateProfileIntW(section.c_str(), L"SizeKnown", 0, g_downloadsStatePath.c_str()) != 0;
         resume.totalSize = _wcstoui64(ReadStateString(section.c_str(), L"TotalSize", g_downloadsStatePath).c_str(), nullptr, 10);
         resume.segmentBytes = _wcstoui64(ReadStateString(section.c_str(), L"SegmentBytes", g_downloadsStatePath).c_str(), nullptr, 10);
@@ -1259,6 +1276,88 @@ std::wstring GetProgressTextLocked(const Download& download) {
     return std::to_wstring(percent) + L"%";
 }
 
+std::wstring GetDownloadStatusTextLocked(const Download& download) {
+    const std::wstring& status = download.statusText;
+    const std::wstring& error = download.lastError;
+    const auto statusHas = [&](const wchar_t* value) { return status.find(value) != std::wstring::npos; };
+    const auto errorHas = [&](const wchar_t* value) { return error.find(value) != std::wstring::npos; };
+
+    if (download.userPaused) return download.pauseSettled ? L"Paused" : L"Pausing — saving progress";
+    if (download.phase == DownloadPhase::Paused) return L"Paused";
+    if (download.phase == DownloadPhase::Pausing) return L"Pausing — saving progress";
+
+    switch (download.phase) {
+    case DownloadPhase::Queued:
+        return statusHas(L"retry") ? L"Retry queued" : L"Queued";
+    case DownloadPhase::Probing:
+        return L"Checking mirrors";
+    case DownloadPhase::DownloadingParallel:
+        if (statusHas(L"Finalizing file") || statusHas(L"finalizing file")) return L"Finalizing file";
+        if (statusHas(L"Waiting before retrying")) return L"Waiting to retry";
+        if (statusHas(L"Waiting for mirror checks")) return L"Checking mirrors";
+        if (statusHas(L"No usable parallel range source")) return L"No compatible mirror — progress kept";
+        return L"Downloading (parallel)";
+    case DownloadPhase::DownloadingFallback:
+        if (statusHas(L"finalizing file")) return L"Finalizing file";
+        if (statusHas(L"Waiting before retrying")) return L"Waiting to retry";
+        if (statusHas(L"Waiting for mirror checks")) return L"Checking mirrors";
+        return L"Downloading (sequential)";
+    case DownloadPhase::Completed:
+        return L"Completed";
+    case DownloadPhase::CancelledKept:
+        return L"Cancelled — partial saved";
+    case DownloadPhase::Cancelled:
+        return L"Cancelled";
+    case DownloadPhase::Failed:
+        if (statusHas(L"Saved parallel chunks kept"))
+            return L"Mode change needed — chunks kept";
+        if (statusHas(L"Saved chunks kept"))
+            return L"Mirror check — chunks kept";
+        if (statusHas(L"Source version mismatch") || errorHas(L"mirrors do not match the file version"))
+            return L"Source mismatch — chunks kept";
+        if (statusHas(L"No usable range mirror"))
+            return L"No compatible mirror — progress kept";
+        if (statusHas(L"Source size changed") || errorHas(L"source file size changed"))
+            return L"Source size changed — progress kept";
+        if (statusHas(L"Chunk map missing"))
+            return L"Chunk map missing — file kept";
+        if (statusHas(L"Parallel stopped"))
+            return L"Parallel stopped — progress kept";
+        if (statusHas(L"Failed to finalize"))
+            return L"Finalization failed — data kept";
+        if (statusHas(L"Cancellation could not hand off"))
+            return L"Cancel failed — partial kept";
+        if (statusHas(L"Cancellation could not delete"))
+            return L"Cancel failed — file kept";
+        if (statusHas(L"Retry stopped"))
+            return L"Retry blocked — file unchanged";
+        if (statusHas(L"Cancelling;"))
+            return L"Cancellation interrupted — review data";
+        if (statusHas(L"Working file kept") || errorHas(L"Sequential data was kept") ||
+            errorHas(L"existing .linkforge.part file contains data"))
+            return L"Retry confirmation needed — data kept";
+        if (statusHas(L"Sequential mirrors exhausted") || errorHas(L"All usable mirrors failed") ||
+            errorHas(L"All compatible mirrors failed"))
+            return L"All mirrors failed — retry available";
+        return L"Download stopped — see details";
+    case DownloadPhase::Pausing:
+        return L"Pausing — saving progress";
+    case DownloadPhase::Paused:
+        return L"Paused";
+    }
+    return L"Unknown status";
+}
+
+std::wstring GetDownloadStatusTooltipLocked(const Download& download) {
+    const std::wstring displayStatus = GetDownloadStatusTextLocked(download);
+    std::wstring result = L"Status: " + displayStatus;
+    if (!download.statusText.empty() && download.statusText != displayStatus)
+        result += L"\r\n\r\nState: " + download.statusText;
+    if (!download.lastError.empty() && download.lastError != download.statusText)
+        result += L"\r\n\r\nDetails:\r\n" + download.lastError;
+    return result;
+}
+
 void SampleSpeeds() {
     const uint64_t now = GetTickCount64();
     for (const auto& download : g_downloads) {
@@ -1361,7 +1460,8 @@ HWND CreateListCellTooltip(HWND owner, HWND list, HWND extraControl = nullptr) {
 }
 
 bool HandleListCellTooltip(HWND tooltip, HWND list, int statusColumn, HWND extraControl,
-                           std::wstring& textStorage, LPARAM lParam) {
+                           std::wstring& textStorage, LPARAM lParam,
+                           const std::wstring* extraControlTooltip = nullptr) {
     const auto* header = reinterpret_cast<const NMHDR*>(lParam);
     if (!header || header->hwndFrom != tooltip || header->code != TTN_GETDISPINFOW)
         return false;
@@ -1371,7 +1471,7 @@ bool HandleListCellTooltip(HWND tooltip, HWND list, int statusColumn, HWND extra
     GetCursorPos(&cursor);
     const HWND hovered = WindowFromPoint(cursor);
     if (extraControl && hovered == extraControl) {
-        textStorage = GetWindowTextString(extraControl);
+        textStorage = extraControlTooltip ? *extraControlTooltip : GetWindowTextString(extraControl);
     } else if (list) {
         POINT client = cursor;
         ScreenToClient(list, &client);
@@ -1379,10 +1479,16 @@ bool HandleListCellTooltip(HWND tooltip, HWND list, int statusColumn, HWND extra
         hit.pt = client;
         const int row = ListView_SubItemHitTest(list, &hit);
         if (row >= 0 && hit.iSubItem == statusColumn) {
-            wchar_t cellText[8192]{};
-            ListView_GetItemText(list, row, statusColumn, cellText,
-                                 static_cast<int>(std::size(cellText)));
-            textStorage = cellText;
+            if (list == g_mainList && statusColumn == 5 && row < static_cast<int>(g_downloads.size())) {
+                const auto& download = g_downloads[static_cast<size_t>(row)];
+                std::lock_guard lock(download->mutex);
+                textStorage = GetDownloadStatusTooltipLocked(*download);
+            } else {
+                wchar_t cellText[8192]{};
+                ListView_GetItemText(list, row, statusColumn, cellText,
+                                     static_cast<int>(std::size(cellText)));
+                textStorage = cellText;
+            }
         }
     }
 
@@ -1438,9 +1544,7 @@ void UpdateMainList() {
         SetListCell(g_mainList, row, 2, GetSizeTextLocked(*download));
         SetListCell(g_mainList, row, 3, FormatSpeed(download->speedBps));
         SetListCell(g_mainList, row, 4, GetEtaLocked(*download, now));
-        const std::wstring visibleStatus = download->userPaused
-            ? (download->pauseSettled ? L"Paused" : L"Pausing - flushing active ranges")
-            : download->statusText;
+        const std::wstring visibleStatus = GetDownloadStatusTextLocked(*download);
         SetListCell(g_mainList, row, 5, visibleStatus);
 
         const uint64_t progressBytes = GetProgressBytesLocked(*download);
@@ -1485,6 +1589,7 @@ void RefreshDetails(DetailsContext* context) {
     std::shared_ptr<Download> download = context->download;
     std::vector<std::shared_ptr<Mirror>> mirrors;
     std::wstring summary;
+    std::wstring summaryTooltip;
     bool terminal = false;
     bool canRetry = false;
     bool canSwitchMode = false;
@@ -1499,11 +1604,10 @@ void RefreshDetails(DetailsContext* context) {
         const std::wstring average = averageSpeedBps >= 1.0 ? FormatSpeed(averageSpeedBps) : L"—";
         const uint64_t chunkBytes = download->persistentSegmentBytes ? download->persistentSegmentBytes : download->restoredSegmentBytes;
         const std::wstring chunkSizeText = chunkBytes ? FormatBytes(chunkBytes) : L"not set";
-        std::wstring shortStatus = download->lastError.empty() ? download->statusText : download->lastError;
-        // Normal transfer-state text repeats the selected mode shown on the first row.
-        if (shortStatus == L"Downloading with parallel byte ranges" ||
-            shortStatus == L"Downloading from one mirror at a time" ||
-            shortStatus == L"Downloading from mirror") {
+        std::wstring shortStatus = GetDownloadStatusTextLocked(*download);
+        // The selected mode is already shown on the first summary row.
+        if (shortStatus == L"Downloading (parallel)" ||
+            shortStatus == L"Downloading (sequential)") {
             shortStatus.clear();
         }
         const std::wstring summaryFirstRow =
@@ -1516,12 +1620,14 @@ void RefreshDetails(DetailsContext* context) {
             L"   ·   Current: " + FormatSpeed(download->speedBps) + L"   ·   Avg: " + average +
             (shortStatus.empty() ? std::wstring() : L"   ·   Status: " + shortStatus);
         summary = summaryFirstRow + L"\r\n" + summarySecondRow;
+        summaryTooltip = summary + L"\r\n\r\n" + GetDownloadStatusTooltipLocked(*download);
         terminal = download->terminal;
         canRetry = download->phase == DownloadPhase::Failed || download->phase == DownloadPhase::Cancelled ||
                    download->phase == DownloadPhase::CancelledKept;
         canSwitchMode = canRetry;
         singleMirrorOnly = download->singleMirrorOnly;
     }
+    context->summaryTooltipText = std::move(summaryTooltip);
     SetWindowTextW(context->summaryLabel, summary.c_str());
     const auto currentSettings = linkforge::GetSettings();
     EnableWindow(context->addButton, !terminal || canRetry);
@@ -2087,7 +2193,8 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_NOTIFY: {
         auto* header = reinterpret_cast<NMHDR*>(lParam);
         if (context && HandleListCellTooltip(context->tooltip, context->list, 6,
-                                             context->summaryLabel, context->tooltipText, lParam))
+                                             context->summaryLabel, context->tooltipText, lParam,
+                                             &context->summaryTooltipText))
             return 0;
         if (header && header->hwndFrom == context->list && header->code == NM_CUSTOMDRAW) {
             return HandleListCustomDraw(context->list, lParam, false);
