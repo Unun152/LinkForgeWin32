@@ -27,6 +27,7 @@ using linkforge::DownloadPhase;
 using linkforge::Mirror;
 using linkforge::RetryResult;
 using linkforge::ModeSwitchResult;
+using linkforge::WorkingFileAction;
 using linkforge::Segment;
 
 namespace {
