@@ -236,6 +236,7 @@ public:
 
 private:
     void Run();
+    void RunInternal(); // Run() performs a final cancellation check after all worker exits.
     void RunParallel();
     bool RunFallback(); // true means success
     bool PrepareParallelFile(std::wstring& error);

@@ -1318,7 +1318,7 @@ bool Download::RequestCancel(bool keepPartial) {
     // perform the same file and resume-state cleanup synchronously.
     if (finishImmediately) {
         Join();
-        FinishCancelled();
+        if (cancelRequested.load()) FinishCancelled();
     }
     return true;
 }
@@ -2789,6 +2789,11 @@ void Download::ClearResumeDataLocked() {
 }
 
 void Download::FinishCancelled() {
+    struct ResetCancelFlag {
+        std::atomic<bool>& flag;
+        ~ResetCancelFlag() { flag.store(false); }
+    } resetCancelFlag{cancelRequested};
+
     if (shutdownRequested.load()) {
         // Process shutdown is not a user cancellation. Keep the resumable
         // .linkforge.part file and its durable range checkpoints in place.
@@ -2811,7 +2816,7 @@ void Download::FinishCancelled() {
         bool alreadyPreserved = false;
         {
             std::lock_guard lock(mutex);
-            alreadyPreserved = !partialPath.empty() && partPath == partialPath;
+            alreadyPreserved = partialKept && !partialPath.empty() && partPath == partialPath;
         }
         if (!alreadyPreserved) PreservePartialFile();
 
@@ -2826,15 +2831,22 @@ void Download::FinishCancelled() {
             bool renamed = false;
             {
                 std::lock_guard lock(mutex);
-                renamed = !partialPath.empty() && partPath == partialPath;
+                renamed = partialKept && !partialPath.empty() && partPath == partialPath;
                 keptPath = partPath;
-                partialPath = partPath;
+                if (renamed) {
+                    partialPath = partPath;
+                    partialKept = true;
+                    lastError.clear();
+                } else {
+                    // The rename/flush failed. Keep the original file and map,
+                    // but allow a later Keep attempt to retry the rename.
+                    partialPath.clear();
+                    partialKept = false;
+                }
                 userPaused = false;
                 pauseRequested.store(false);
                 pauseSettled = false;
                 pauseCheckpointPending = false;
-                partialKept = true;
-                if (renamed) lastError.clear();
             }
             SetStatus(*this, DownloadPhase::CancelledKept,
                       renamed ? L"Cancelled - partial file kept: " + keptPath
@@ -2955,6 +2967,14 @@ void Download::FinishCancelled() {
 }
 
 void Download::Run() {
+    RunInternal();
+    // Catch cancellation requests that arrive after RunInternal's last in-loop
+    // check but before its manager thread exits. RequestCancel() joins and handles
+    // the other side of the same race when the thread has already returned.
+    if (cancelRequested.load()) FinishCancelled();
+}
+
+void Download::RunInternal() {
     {
         std::lock_guard lock(mutex);
         phase = DownloadPhase::Probing;
