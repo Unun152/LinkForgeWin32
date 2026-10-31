@@ -1879,6 +1879,11 @@ bool Download::PrepareParallelFile(std::wstring& error) {
         CloseHandle(file);
         return false;
     }
+    if (!useRestore && fileExisted && !existingSizeKnown) {
+        error = L"Could not inspect the existing partial file size; leaving the file unchanged.";
+        CloseHandle(file);
+        return false;
+    }
     if (!useRestore && fileExisted && existingSizeKnown && existingSize.QuadPart > 0) {
         CloseHandle(file);
         std::wstring archivedPath, archiveError;
