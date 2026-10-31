@@ -788,7 +788,36 @@ std::wstring FormatDuration(double seconds) {
 }
 
 uint64_t GetProgressBytesLocked(const Download& download) {
-    if (!download.parallelMode && download.phase != DownloadPhase::Completed) return download.fallbackBytes;
+    if (!download.parallelMode && download.phase != DownloadPhase::Completed) {
+        // A restored parallel download has durable chunk offsets before its Segment
+        // array is rebuilt by the worker path. Use that saved map for display while
+        // paused, failed, probing mirrors, or waiting for Retry to resume.
+        if (download.restorePending && download.restoredSegmentBytes > 0 &&
+            download.restoredTotalSize > 0) {
+            const uint64_t totalSize = download.restoredTotalSize;
+            const uint64_t segmentBytes = download.restoredSegmentBytes;
+            const uint64_t segmentCount = 1 + (totalSize - 1) / segmentBytes;
+            uint64_t result = 0;
+
+            for (const uint64_t index : download.restoredCompletedSegmentIndices) {
+                if (index >= segmentCount) continue;
+                const uint64_t start = index * segmentBytes;
+                result += std::min(segmentBytes, totalSize - start);
+            }
+            for (const auto& [index, committedBytes] : download.restoredPartialSegmentBytes) {
+                if (index >= segmentCount ||
+                    std::find(download.restoredCompletedSegmentIndices.begin(),
+                              download.restoredCompletedSegmentIndices.end(), index) !=
+                        download.restoredCompletedSegmentIndices.end()) continue;
+                const uint64_t start = index * segmentBytes;
+                const uint64_t segmentLength = std::min(segmentBytes, totalSize - start);
+                result += std::min(committedBytes, segmentLength);
+            }
+            return std::min(result, totalSize);
+        }
+        return download.fallbackBytes;
+    }
+
     uint64_t result = download.completedBytes;
     for (const auto& segment : download.segments) {
         if (segment.state != 2) result += segment.committedBytes;
