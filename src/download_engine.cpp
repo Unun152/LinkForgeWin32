@@ -1707,8 +1707,13 @@ void Download::ProbeInitialMirrors() {
             // Re-check under the lock so an URL added just as the initial scan ends
             // cannot be stranded in the pending list without a probe thread.
             std::lock_guard lock(mutex);
-            const bool hasUsableMirror = std::any_of(mirrors.begin(), mirrors.end(), [](const auto& mirror) {
-                return mirror->active && mirror->probeDone && mirror->probeOk && mirror->compatible;
+            const bool hasUsableMirror = std::any_of(mirrors.begin(), mirrors.end(), [&](const auto& mirror) {
+                if (!mirror->active || !mirror->probeDone || !mirror->probeOk || !mirror->compatible)
+                    return false;
+                // Parallel mode must wait for a range-capable source. A merely usable
+                // sequential mirror must not end probing while other mirrors may still
+                // provide the byte ranges required by the user's explicit mode.
+                return singleMirrorOnly || (mirror->rangeCapable && mirror->sizeKnown);
             });
             const bool hasPendingOrRunningProbe = std::any_of(mirrors.begin(), mirrors.end(), [](const auto& mirror) {
                 return mirror->active && (mirror->probePending || mirror->probeRunning);
@@ -1786,8 +1791,11 @@ bool Download::PrepareParallelFile(std::wstring& error) {
     LARGE_INTEGER existingSize{};
     const bool existingSizeKnown = GetFileSizeEx(file, &existingSize) != FALSE;
     if (useRestore && (!existingSizeKnown || existingSize.QuadPart != static_cast<LONGLONG>(sizeToPrepare))) {
-        useRestore = false;
-        completedIndices.clear();
+        // Do not resize or overwrite a partial file whose saved chunk offsets refer
+        // to a different file length. Keep both the file and its resume metadata.
+        error = L"The existing partial file size does not match the saved resume information; the file was left unchanged.";
+        CloseHandle(file);
+        return false;
     }
     LARGE_INTEGER size{};
     size.QuadPart = static_cast<LONGLONG>(sizeToPrepare);
@@ -2303,24 +2311,39 @@ void Download::Run() {
         FinishCancelled();
         return;
     }
+    bool restoredDataUnverified = false;
+    bool restoredDataMismatch = false;
     {
         std::lock_guard lock(mutex);
         if (restorePending) {
-            const bool referenceMatches = rangeReferenceReady && sizeKnown &&
-                totalSize == restoredTotalSize &&
-                referencePrefixHash == restoredReferencePrefixHash &&
-                referenceMiddleHash == restoredReferenceMiddleHash &&
-                referenceSuffixHash == restoredReferenceSuffixHash;
-            if (!referenceMatches) {
-                // A mirror changed content or metadata since the last session. Never
-                // combine old completed ranges with a new version of the file.
-                restorePending = false;
-                restoredCompletedSegmentIndices.clear();
-                restoredPartialSegmentBytes.clear();
-                restoredSegmentBytes = 0;
-                persistentSegmentBytes = 0;
+            // A missing/failed range probe does not prove that the source changed.
+            // Keep the saved offsets until a range-capable mirror can be sampled.
+            if (!rangeReferenceReady || !referenceSizeKnown || totalSize == 0) {
+                restoredDataUnverified = true;
+            } else {
+                const bool referenceMatches = totalSize == restoredTotalSize &&
+                    referencePrefixHash == restoredReferencePrefixHash &&
+                    referenceMiddleHash == restoredReferenceMiddleHash &&
+                    referenceSuffixHash == restoredReferenceSuffixHash;
+                restoredDataMismatch = !referenceMatches;
             }
         }
+    }
+    if (restoredDataUnverified) {
+        {
+            std::lock_guard lock(mutex);
+            lastError = L"Could not validate the saved partial file because no usable parallel-range reference is currently available. The partial file and saved chunk progress were kept; check the mirrors and press Retry again.";
+        }
+        SetStatus(*this, DownloadPhase::Failed, L"Saved parallel progress retained - mirror check needed");
+        return;
+    }
+    if (restoredDataMismatch) {
+        {
+            std::lock_guard lock(mutex);
+            lastError = L"The current mirrors do not match the file version used for the saved chunks. The old partial file and chunk progress were kept; refusing to overwrite or combine different file versions.";
+        }
+        SetStatus(*this, DownloadPhase::Failed, L"Saved partial version mismatch - data retained");
+        return;
     }
 
     bool canParallel = false;
@@ -2337,17 +2360,13 @@ void Download::Run() {
     if (!canParallel && !singleMirrorOnly) {
         // Parallel mode is an explicit per-download choice. Never silently switch
         // this file to one mirror just because range checks or a transfer failed.
+        // In particular, do not discard durable chunks or the partial file when
+        // mirrors are temporarily unavailable or cannot currently prove compatibility.
         {
             std::lock_guard lock(mutex);
-            restorePending = false;
-            restoredCompletedSegmentIndices.clear();
-            restoredPartialSegmentBytes.clear();
-            restoredSegmentBytes = 0;
-            persistentSegmentBytes = 0;
-            lastError = L"Parallel mode was selected, but no compatible mirror currently supports HTTP byte ranges. Choose single-mirror mode explicitly to download sequentially.";
+            lastError = L"Parallel mode was selected, but no compatible mirror currently supports HTTP byte ranges. The partial file and any saved chunk progress were kept. Check the mirrors and press Retry again, or explicitly create a new download if you want to start over.";
         }
-        CleanupPartFile();
-        SetStatus(*this, DownloadPhase::Failed, L"Parallel mode unavailable");
+        SetStatus(*this, DownloadPhase::Failed, L"Parallel mode unavailable - partial data kept");
         return;
     }
     if (!canParallel && singleMirrorOnly) {
