@@ -90,6 +90,8 @@ const COLORREF kBorder = RGB(55, 60, 70);
 HINSTANCE g_instance = nullptr;
 HWND g_mainWindow = nullptr;
 HWND g_mainList = nullptr;
+HWND g_mainTooltip = nullptr;
+std::wstring g_mainTooltipText;
 HWND g_statusText = nullptr;
 HWND g_pauseButton = nullptr;
 HWND g_clearCompletedButton = nullptr;
@@ -128,6 +130,8 @@ struct DetailsContext {
     HWND fileLabel = nullptr;
     HWND summaryLabel = nullptr;
     HWND list = nullptr;
+    HWND tooltip = nullptr;
+    std::wstring tooltipText;
     HWND addButton = nullptr;
     HWND removeButton = nullptr;
     HWND retryButton = nullptr;
@@ -941,6 +945,67 @@ bool SetListCell(HWND list, int row, int column, const std::wstring& text) {
     return true;
 }
 
+HWND CreateListCellTooltip(HWND owner, HWND list, HWND extraControl = nullptr) {
+    if (!owner || !list) return nullptr;
+    HWND tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                   WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                   CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                   owner, nullptr, g_instance, nullptr);
+    if (!tooltip) return nullptr;
+
+    auto addTool = [tooltip, owner](HWND control) {
+        if (!control) return;
+        TOOLINFOW tool{};
+        tool.cbSize = sizeof(tool);
+        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        tool.hwnd = owner;
+        tool.uId = reinterpret_cast<UINT_PTR>(control);
+        tool.lpszText = LPSTR_TEXTCALLBACKW;
+        SendMessageW(tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+    };
+    addTool(list);
+    addTool(extraControl);
+
+    SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, 640);
+    SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 450);
+    SetWindowPos(tooltip, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    return tooltip;
+}
+
+bool HandleListCellTooltip(HWND tooltip, HWND list, int statusColumn, HWND extraControl,
+                           std::wstring& textStorage, LPARAM lParam) {
+    const auto* header = reinterpret_cast<const NMHDR*>(lParam);
+    if (!header || header->hwndFrom != tooltip || header->code != TTN_GETDISPINFOW)
+        return false;
+
+    textStorage.clear();
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    const HWND hovered = WindowFromPoint(cursor);
+    if (extraControl && hovered == extraControl) {
+        textStorage = GetWindowTextString(extraControl);
+    } else if (list) {
+        POINT client = cursor;
+        ScreenToClient(list, &client);
+        LVHITTESTINFO hit{};
+        hit.pt = client;
+        const int row = ListView_SubItemHitTest(list, &hit);
+        if (row >= 0 && hit.iSubItem == statusColumn) {
+            wchar_t cellText[8192]{};
+            ListView_GetItemText(list, row, statusColumn, cellText,
+                                 static_cast<int>(std::size(cellText)));
+            textStorage = cellText;
+        }
+    }
+
+    auto* display = reinterpret_cast<NMTTDISPINFOW*>(lParam);
+    display->lpszText = textStorage.empty()
+        ? const_cast<LPWSTR>(L"")
+        : textStorage.data();
+    return true;
+}
+
 void UpdateMainList() {
     if (!g_mainList) return;
     const uint64_t now = GetTickCount64();
@@ -1053,8 +1118,6 @@ void RefreshDetails(DetailsContext* context) {
             shortStatus == L"Downloading from one mirror at a time" ||
             shortStatus == L"Downloading from mirror") {
             shortStatus.clear();
-        } else if (shortStatus.size() > 48) {
-            shortStatus = shortStatus.substr(0, 45) + L"...";
         }
         const std::wstring summaryFirstRow =
             L"Mirrors: " + std::to_wstring(download->activeRequests) + L"/" + std::to_wstring(download->mirrors.size()) +
@@ -1563,6 +1626,7 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         AddColumn(context->list, 5, L"Mode / connections", 105);
         AddColumn(context->list, 6, L"Status / error", 140);
         AddColumn(context->list, 7, L"Chunks done / active / failed", 150);
+        context->tooltip = CreateListCellTooltip(hwnd, context->list, context->summaryLabel);
         context->addButton = CreateDarkButton(hwnd, L"＋ Add mirrors", ID_DETAIL_ADD, 18, 490, 138, 34);
         context->removeButton = CreateDarkButton(hwnd, L"Remove mirror", ID_DETAIL_REMOVE, 164, 490, 130, 34);
         context->retryButton = CreateDarkButton(hwnd, L"Retry download", ID_DETAIL_RETRY, 302, 490, 130, 34);
@@ -1629,6 +1693,9 @@ LRESULT CALLBACK DetailsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     }
     case WM_NOTIFY: {
         auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (context && HandleListCellTooltip(context->tooltip, context->list, 6,
+                                             context->summaryLabel, context->tooltipText, lParam))
+            return 0;
         if (header && header->hwndFrom == context->list && header->code == NM_CUSTOMDRAW) {
             return HandleListCustomDraw(context->list, lParam, false);
         }
@@ -1947,6 +2014,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         AddColumn(g_mainList, 3, L"Speed", 105);
         AddColumn(g_mainList, 4, L"ETA (avg)", 95);
         AddColumn(g_mainList, 5, L"Status", 210);
+        g_mainTooltip = CreateListCellTooltip(hwnd, g_mainList);
         g_statusText = CreateLabel(hwnd, L"Ready", 22, 608, 900, 22);
         g_clearCompletedButton = CreateDarkButton(hwnd, L"Clear completed", ID_CLEAR_COMPLETED, 0, 0, 120, 30);
         RECT initialClient{};
@@ -2021,11 +2089,15 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
                     L"What should LinkForge do with the data already downloaded?\n\nYes: cancel and keep it as a .partial file.\nNo: cancel and delete the partial data.\nCancel: continue downloading.",
                     L"Cancel download", MB_YESNOCANCEL | MB_ICONQUESTION);
                 if (choice == IDYES || choice == IDNO) {
-                    download->RequestCancel(choice == IDYES);
-                    std::lock_guard lock(download->mutex);
-                    download->statusText = choice == IDYES ? L"Cancelling; keeping partial data..." : L"Cancelling; deleting partial data...";
+                    if (!download->RequestCancel(choice == IDYES)) {
+                        MessageBoxW(hwnd,
+                            L"This download cannot be cancelled in its current state. Completed downloads must be removed through Remove entry.",
+                            L"Cannot cancel download", MB_OK | MB_ICONINFORMATION);
+                    } else {
+                        PersistDownloadsToFile();
+                        UpdateMainList();
+                    }
                 }
-                PersistDownloadsToFile();
             }
             return 0;
         }
@@ -2170,6 +2242,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     case WM_NOTIFY: {
         auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (HandleListCellTooltip(g_mainTooltip, g_mainList, 5, nullptr, g_mainTooltipText, lParam))
+            return 0;
         if (header && header->hwndFrom == g_mainList && header->code == NM_CUSTOMDRAW) {
             return HandleListCustomDraw(g_mainList, lParam, true);
         }

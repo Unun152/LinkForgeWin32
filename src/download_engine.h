@@ -149,7 +149,7 @@ public:
     Download& operator=(const Download&) = delete;
 
     void Start();
-    void RequestCancel(bool keepPartial = false);
+    bool RequestCancel(bool keepPartial = false);
     void RequestShutdown(); // stop I/O for process exit without cancelling or renaming the partial file
     void Pause();
     void Resume();
@@ -241,6 +241,7 @@ private:
     bool PrepareParallelFile(std::wstring& error);
     bool FinalizeFile(std::wstring& error);
     bool CleanupPartFile(std::wstring& error);
+    void ClearResumeDataLocked(); // caller holds mutex
     void PreservePartialFile();
     void FinishCancelled();
     void ProbeInitialMirrors();

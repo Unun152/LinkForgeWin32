@@ -1264,7 +1264,8 @@ Download::Download(const std::wstring& folder, const std::wstring& name,
 }
 
 Download::~Download() {
-    RequestCancel();
+    // Object destruction is not an explicit user cancel. Preserve resumable data.
+    RequestShutdown();
     Join();
 }
 
@@ -1292,16 +1293,47 @@ void Download::Start() {
     managerThread = std::thread([self]() { self->Run(); });
 }
 
-void Download::RequestCancel(bool keepPartial) {
-    keepPartialOnCancel.store(keepPartial);
-    cancelRequested.store(true);
+bool Download::RequestCancel(bool keepPartial) {
+    bool finishImmediately = false;
+    {
+        std::lock_guard lock(mutex);
+        if (phase == DownloadPhase::Completed || shutdownRequested.load()) return false;
+
+        keepPartialOnCancel.store(keepPartial);
+        cancelRequested.store(true);
+        stopProbeRequests.store(true);
+        finishImmediately = terminal || !started;
+        if (!finishImmediately) {
+            userPaused = false;
+            statusText = keepPartial
+                ? L"Cancelling; keeping partial data..."
+                : L"Cancelling; deleting partial data...";
+        }
+    }
+
     cv.notify_all();
+
+    // A stopped job has no manager thread left to process the cancel request.
+    // Join first in case the worker has just reached its terminal state, then
+    // perform the same file and resume-state cleanup synchronously.
+    if (finishImmediately) {
+        Join();
+        FinishCancelled();
+    }
+    return true;
 }
 
 void Download::RequestShutdown() {
-    shutdownRequested.store(true);
-    stopProbeRequests.store(true);
-    cancelRequested.store(true);
+    {
+        std::lock_guard lock(mutex);
+        // An explicit user cancellation already has a keep/delete decision.
+        // Do not turn it into a shutdown-preserve operation while it is finishing.
+        if (!cancelRequested.load()) {
+            shutdownRequested.store(true);
+            stopProbeRequests.store(true);
+            cancelRequested.store(true);
+        }
+    }
     cv.notify_all();
 }
 
@@ -2666,13 +2698,39 @@ bool Download::CleanupPartFile(std::wstring& error) {
 
 void Download::PreservePartialFile() {
     if (partPath.empty()) return;
+
+    const DWORD attributes = GetFileAttributesW(partPath.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const DWORD code = GetLastError();
+        if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND) {
+            std::lock_guard lock(mutex);
+            lastError = L"Could not inspect the partial file before preserving it. Windows error: " +
+                        std::to_wstring(code) + L" (" + partPath + L")";
+        }
+        return;
+    }
+
     HANDLE file = CreateFileW(partPath.c_str(), GENERIC_READ | GENERIC_WRITE,
                               FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
-    FlushFileBuffers(file);
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        std::lock_guard lock(mutex);
+        lastError = L"Could not open the partial file to flush it before preserving it. Windows error: " +
+                    std::to_wstring(code) + L" (" + partPath + L")";
+        return;
+    }
+    const bool flushed = FlushFileBuffers(file) != FALSE;
+    const DWORD flushError = flushed ? ERROR_SUCCESS : GetLastError();
     CloseHandle(file);
+    if (!flushed) {
+        std::lock_guard lock(mutex);
+        lastError = L"Could not flush the partial file before preserving it. Windows error: " +
+                    std::to_wstring(flushError) + L" (" + partPath + L")";
+        return;
+    }
 
     const std::wstring base = finalPath + L".partial";
+    DWORD moveError = ERROR_SUCCESS;
     for (unsigned int index = 0; index < 10000; ++index) {
         std::wstring candidate = base;
         if (index > 0) candidate = finalPath + L" (" + std::to_wstring(index) + L").partial";
@@ -2681,13 +2739,53 @@ void Download::PreservePartialFile() {
             partPath = candidate;
             partialPath = candidate;
             partialKept = true;
+            lastError.clear();
             return;
         }
-        const DWORD error = GetLastError();
-        if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) break;
+        moveError = GetLastError();
+        if (moveError != ERROR_ALREADY_EXISTS && moveError != ERROR_FILE_EXISTS) break;
     }
     std::lock_guard lock(mutex);
-    lastError = L"Could not rename the partial file; it remains at: " + partPath;
+    lastError = L"Could not rename the partial file; it remains at: " + partPath +
+                L" (Windows error: " + std::to_wstring(moveError) + L")";
+}
+
+void Download::ClearResumeDataLocked() {
+    restorePending = false;
+    persistentSegmentBytes = 0;
+    restoredTotalSize = 0;
+    restoredSegmentBytes = 0;
+    restoredReferencePrefixHash = 0;
+    restoredReferenceMiddleHash = 0;
+    restoredReferenceSuffixHash = 0;
+    referencePrefixHash = 0;
+    referenceMiddleHash = 0;
+    referenceSuffixHash = 0;
+    restoredCompletedSegmentIndices.clear();
+    restoredPartialSegmentBytes.clear();
+    segments.clear();
+    completedSegments = 0;
+
+    sizeKnown = false;
+    totalSize = 0;
+    completedBytes = 0;
+    fallbackBytes = 0;
+
+    resumeFallbackPending = false;
+    resumeFallbackMirrorUrl.clear();
+    referenceReady = false;
+    referenceSizeKnown = false;
+    referenceSize = 0;
+    referencePrefix.clear();
+    rangeReferenceReady = false;
+    rangeReferenceMiddle.clear();
+    rangeReferenceSuffix.clear();
+
+    firstTransferTick = 0;
+    endTransferTick = 0;
+    speedBps = 0.0;
+    lastSpeedSampleBytes = networkBytes;
+    speedSampleTick = 0;
 }
 
 void Download::FinishCancelled() {
@@ -2708,37 +2806,122 @@ void Download::FinishCancelled() {
         cv.notify_all();
         return;
     }
+
     if (keepPartialOnCancel.load()) {
-        PreservePartialFile();
-        bool kept = false;
-        std::wstring keptPath;
+        bool alreadyPreserved = false;
         {
             std::lock_guard lock(mutex);
-            kept = partialKept;
-            keptPath = partialPath;
+            alreadyPreserved = !partialPath.empty() && partPath == partialPath;
         }
-        if (kept) {
-            SetStatus(*this, DownloadPhase::CancelledKept, L"Cancelled - partial file kept: " + keptPath);
+        if (!alreadyPreserved) PreservePartialFile();
+
+        const DWORD attributes = partPath.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(partPath.c_str());
+        const DWORD inspectError = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+        const bool partExists = attributes != INVALID_FILE_ATTRIBUTES;
+        const bool partMissing = !partExists &&
+            (inspectError == ERROR_FILE_NOT_FOUND || inspectError == ERROR_PATH_NOT_FOUND);
+
+        if (partExists) {
+            std::wstring keptPath;
+            bool renamed = false;
+            {
+                std::lock_guard lock(mutex);
+                renamed = !partialPath.empty() && partPath == partialPath;
+                keptPath = partPath;
+                partialPath = partPath;
+                userPaused = false;
+                pauseRequested.store(false);
+                pauseSettled = false;
+                pauseCheckpointPending = false;
+                partialKept = true;
+                if (renamed) lastError.clear();
+            }
+            SetStatus(*this, DownloadPhase::CancelledKept,
+                      renamed ? L"Cancelled - partial file kept: " + keptPath
+                              : L"Cancelled - partial file remains at: " + keptPath);
             return;
         }
-        // If preservation failed, do not silently delete the user's downloaded bytes.
-        SetStatus(*this, DownloadPhase::CancelledKept, L"Cancelled - partial file remains at: " + partPath);
+
+        if (!partMissing) {
+            {
+                std::lock_guard lock(mutex);
+                userPaused = false;
+                pauseRequested.store(false);
+                pauseSettled = false;
+                pauseCheckpointPending = false;
+                partialKept = false;
+                lastError = L"Could not verify the partial file while cancelling. Its path and resume information were left untouched. Windows error: " +
+                            std::to_wstring(inspectError);
+            }
+            SetStatus(*this, DownloadPhase::CancelledKept, L"Cancelled - partial file status unknown; see details");
+            return;
+        }
+
+        std::wstring existingBackup;
+        std::vector<std::wstring> preservedPaths;
+        {
+            std::lock_guard lock(mutex);
+            preservedPaths = preservedPartialPaths;
+        }
+        for (const auto& path : preservedPaths) {
+            if (path.empty()) continue;
+            const DWORD pathAttributes = GetFileAttributesW(path.c_str());
+            if (pathAttributes != INVALID_FILE_ATTRIBUTES) {
+                existingBackup = path;
+                break;
+            }
+            const DWORD pathError = GetLastError();
+            if (pathError != ERROR_FILE_NOT_FOUND && pathError != ERROR_PATH_NOT_FOUND) {
+                existingBackup = path; // Treat an uninspectable backup as present; never discard its metadata.
+                break;
+            }
+        }
+
+        {
+            std::lock_guard lock(mutex);
+            ClearResumeDataLocked();
+            userPaused = false;
+            pauseRequested.store(false);
+            pauseSettled = false;
+            pauseCheckpointPending = false;
+            if (!existingBackup.empty()) {
+                partialKept = true;
+                partialPath = existingBackup;
+            } else {
+                partialKept = false;
+                partialPath.clear();
+            }
+        }
+        if (!existingBackup.empty()) {
+            SetStatus(*this, DownloadPhase::CancelledKept,
+                      L"Cancelled - existing partial backup retained: " + existingBackup);
+        } else {
+            SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled - no partial file existed to keep");
+        }
         return;
     }
+
     std::wstring deletionError;
-    bool deletionSucceeded = CleanupPartFile(deletionError);
+    const std::wstring currentPartPath = partPath;
+    const bool partDeleted = CleanupPartFile(deletionError);
     std::vector<std::wstring> preservedPathsToDelete;
     {
         std::lock_guard lock(mutex);
         preservedPathsToDelete = preservedPartialPaths;
+        if (!partialPath.empty() && partialPath != currentPartPath)
+            preservedPathsToDelete.push_back(partialPath);
     }
+    std::sort(preservedPathsToDelete.begin(), preservedPathsToDelete.end());
+    preservedPathsToDelete.erase(std::unique(preservedPathsToDelete.begin(), preservedPathsToDelete.end()),
+                                 preservedPathsToDelete.end());
 
     std::vector<std::wstring> preservedPathsStillPresent;
+    bool allDeletionsSucceeded = partDeleted;
     for (const auto& preservedPath : preservedPathsToDelete) {
-        if (preservedPath.empty() || preservedPath == partPath) continue;
+        if (preservedPath.empty() || preservedPath == currentPartPath) continue;
         std::wstring pathError;
         if (!DeleteFileIfPresent(preservedPath, pathError, L"Could not delete preserved partial file")) {
-            deletionSucceeded = false;
+            allDeletionsSucceeded = false;
             if (!deletionError.empty()) deletionError += L"\n\n";
             deletionError += pathError;
             preservedPathsStillPresent.push_back(preservedPath);
@@ -2748,10 +2931,24 @@ void Download::FinishCancelled() {
     {
         std::lock_guard lock(mutex);
         preservedPartialPaths = std::move(preservedPathsStillPresent);
-        lastError = deletionSucceeded ? std::wstring() : deletionError;
+        if (partDeleted) {
+            ClearResumeDataLocked();
+            partialKept = false;
+            if (partialPath == currentPartPath ||
+                std::find(preservedPartialPaths.begin(), preservedPartialPaths.end(), partialPath) ==
+                    preservedPartialPaths.end()) {
+                partialPath.clear();
+            }
+        }
+        userPaused = false;
+        pauseRequested.store(false);
+        pauseSettled = false;
+        pauseCheckpointPending = false;
+        lastError = allDeletionsSucceeded ? std::wstring() : deletionError;
     }
-    if (deletionSucceeded) {
-        SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled - partial data deleted");
+
+    if (allDeletionsSucceeded) {
+        SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled - partial data and resume information deleted");
     } else {
         SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled - file deletion failed; see details");
     }
