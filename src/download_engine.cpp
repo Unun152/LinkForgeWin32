@@ -1570,6 +1570,9 @@ RetryResult Download::Retry(WorkingFileAction action, std::wstring& message) {
                 message = fileActionError;
                 return RetryResult::Failed;
             }
+            if (!fileMoved) {
+                // It disappeared after inspection; there is no recovery file to hand off.
+            }
         } else if (action == WorkingFileAction::Delete) {
             if (!DeleteFileIfPresent(partPath, fileActionError,
                                      L"Could not delete the .linkforge.part file after confirmation")) {
@@ -1781,6 +1784,9 @@ ModeSwitchResult Download::SwitchMode(bool targetSingleMirrorOnly, WorkingFileAc
             bool fileMoved = false;
             if (!MoveWorkingFileToUserPartial(oldPartPath, currentFinalPath, fileMoved, message))
                 return ModeSwitchResult::Failed;
+            if (!fileMoved) {
+                // It disappeared after inspection; there is no recovery file to hand off.
+            }
         } else if (action == WorkingFileAction::Delete) {
             if (!DeleteFileIfPresent(oldPartPath, message,
                                      L"Could not delete the .linkforge.part file after confirmation"))
