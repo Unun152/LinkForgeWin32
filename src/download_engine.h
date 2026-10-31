@@ -92,6 +92,7 @@ struct Mirror {
 
 struct DownloadResumeState {
     std::wstring partPath;
+    std::vector<std::wstring> preservedPartialPaths;
     bool sizeKnown = false;
     uint64_t totalSize = 0;
     uint64_t segmentBytes = 0;
@@ -215,6 +216,7 @@ public:
     std::atomic<bool> stopProbeRequests{false};
     bool partialKept = false;
     std::wstring partialPath;
+    std::vector<std::wstring> preservedPartialPaths;
 
 private:
     void Run();

@@ -317,6 +317,7 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         std::vector<std::wstring> urls;
         std::vector<uint64_t> completedSegments;
         std::vector<std::pair<uint64_t, uint64_t>> partialSegments;
+        std::vector<std::wstring> preservedPartialPaths;
         std::wstring folder, filename, finalPath, partPath, phaseName, fallbackMirror;
         uint64_t totalSize = 0, segmentBytes = 0, fallbackBytes = 0;
         uint64_t prefixHash = 0, middleHash = 0, suffixHash = 0;
@@ -329,6 +330,7 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
             filename = download->fileName;
             finalPath = download->finalPath;
             partPath = download->partPath;
+            preservedPartialPaths = download->preservedPartialPaths;
             totalSize = download->totalSize;
             sizeKnown = download->sizeKnown;
             fallbackBytes = download->fallbackBytes;
@@ -371,6 +373,11 @@ bool PersistDownloadsToFile(bool applicationShutdown = false) {
         ok &= WriteStateString(tempPath, section.c_str(), L"FileName", filename);
         ok &= WriteStateString(tempPath, section.c_str(), L"FinalPath", finalPath);
         ok &= WriteStateString(tempPath, section.c_str(), L"PartPath", partPath);
+        ok &= WriteStateString(tempPath, section.c_str(), L"PreservedPartialCount",
+                               std::to_wstring(preservedPartialPaths.size()));
+        for (size_t p = 0; p < preservedPartialPaths.size(); ++p)
+            ok &= WriteStateString(tempPath, section.c_str(), L"PreservedPartial" + std::to_wstring(p),
+                                   preservedPartialPaths[p]);
         ok &= WriteStateString(tempPath, section.c_str(), L"Phase", phaseName);
         ok &= WriteStateString(tempPath, section.c_str(), L"SizeKnown", sizeKnown ? L"1" : L"0");
         ok &= WriteStateString(tempPath, section.c_str(), L"TotalSize", std::to_wstring(totalSize));
@@ -459,6 +466,13 @@ void LoadDownloadsFromFile() {
         // A replacement mirror can be added from the details window after restart.
         linkforge::DownloadResumeState resume;
         resume.partPath = ReadStateString(section.c_str(), L"PartPath", g_downloadsStatePath);
+        const int preservedCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(
+            section.c_str(), L"PreservedPartialCount", 0, g_downloadsStatePath.c_str())), 0, 10000);
+        for (int p = 0; p < preservedCount; ++p) {
+            const std::wstring preserved = ReadStateString(
+                section.c_str(), L"PreservedPartial" + std::to_wstring(p), g_downloadsStatePath);
+            if (!preserved.empty()) resume.preservedPartialPaths.push_back(preserved);
+        }
         resume.sizeKnown = GetPrivateProfileIntW(section.c_str(), L"SizeKnown", 0, g_downloadsStatePath.c_str()) != 0;
         resume.totalSize = _wcstoui64(ReadStateString(section.c_str(), L"TotalSize", g_downloadsStatePath).c_str(), nullptr, 10);
         resume.segmentBytes = _wcstoui64(ReadStateString(section.c_str(), L"SegmentBytes", g_downloadsStatePath).c_str(), nullptr, 10);
@@ -1965,16 +1979,19 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             download->Join();
             if (deleteFiles) {
                 std::wstring finalPath, partPath, partialPath;
+                std::vector<std::wstring> preservedPartialPaths;
                 {
                     std::lock_guard lock(download->mutex);
                     finalPath = download->finalPath;
                     partPath = download->partPath;
                     partialPath = download->partialPath;
+                    preservedPartialPaths = download->preservedPartialPaths;
                 }
                 std::vector<std::wstring> pathsToDelete = {
                     finalPath, partPath, partialPath,
                     finalPath + L".linkforge.part", finalPath + L".partial"
                 };
+                pathsToDelete.insert(pathsToDelete.end(), preservedPartialPaths.begin(), preservedPartialPaths.end());
                 std::sort(pathsToDelete.begin(), pathsToDelete.end());
                 pathsToDelete.erase(std::unique(pathsToDelete.begin(), pathsToDelete.end()), pathsToDelete.end());
                 for (const std::wstring& path : pathsToDelete) {
