@@ -1410,6 +1410,10 @@ void Download::Retry() {
             if (keepExisting) {
                 std::wstring archivedPath, archiveError;
                 if (!ArchiveNonEmptyPartialFile(partPath, finalPath, archivedPath, archiveError)) {
+                    // Restore the saved resume map before returning. The original
+                    // file is still at partPath and remains the source for these offsets.
+                    restoredCompletedSegmentIndices = std::move(savedCompletedIndices);
+                    restoredPartialSegmentBytes = std::move(savedPartialSegments);
                     lastError = archiveError;
                     statusText = L"Retry stopped - existing partial data preserved";
                     return;
@@ -2395,11 +2399,16 @@ void Download::FinishCancelled() {
         return;
     }
     CleanupPartFile();
-    for (const auto& preservedPath : preservedPartialPaths) {
+    std::vector<std::wstring> preservedPathsToDelete;
+    {
+        std::lock_guard lock(mutex);
+        preservedPathsToDelete = preservedPartialPaths;
+        preservedPartialPaths.clear();
+    }
+    for (const auto& preservedPath : preservedPathsToDelete) {
         if (!preservedPath.empty() && preservedPath != partPath)
             DeleteFileW(preservedPath.c_str());
     }
-    preservedPartialPaths.clear();
     SetStatus(*this, DownloadPhase::Cancelled, L"Cancelled - partial data deleted");
 }
 
