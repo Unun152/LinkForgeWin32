@@ -214,6 +214,10 @@ public:
     std::vector<std::pair<uint64_t, uint64_t>> restoredPartialSegmentBytes; // restored in-progress chunk offsets
     bool initialProbeComplete = false;
     bool referenceReady = false;
+    // IDs identify active mirrors that currently back the cached reference samples.
+    // The samples remain a stable fingerprint if their original mirror is removed.
+    int referenceMirrorId = -1;
+    int rangeReferenceMirrorId = -1;
     bool referenceSizeKnown = false;
     uint64_t referenceSize = 0;
     std::vector<unsigned char> referencePrefix;
